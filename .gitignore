@@ -205,3 +205,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Python向け推奨設定（公式: https://github.com/github/gitignore/blob/main/Python.gitignore）
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.env
+.venv
+.envrc
+venv/
+
+# VS Code向け推奨設定
+.vscode/
+.github/
+
+# OSごとの不要ファイル
+.DS_Store
+Thumbs.db
