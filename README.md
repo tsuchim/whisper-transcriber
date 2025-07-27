@@ -1,7 +1,7 @@
 # whisper-transcriber
 
 ## 概要
-RTX4080 + CUDA12.1 + Python3.12環境で動作する高速音声認識ツールです。
+CUDA12.1 + Python3.12環境で動作する高速音声認識ツールです。
 Whisper v3ベースでGPU/CPU自動判定、ノイズ除去、音声前処理に対応。
 
 ## インストール手順
@@ -19,11 +19,20 @@ Whisper v3ベースでGPU/CPU自動判定、ノイズ除去、音声前処理に
 - whisper-v3.py : 音声認識メインスクリプト
 - requirements.txt : 依存パッケージリスト（GPU対応）
 - .github/copilot-instructions.md : Copilot用カスタム指示
-- LICENSE : MIT License
+- LICENSE : Apache License 2.0
+
+## ライセンスについて
+本プロジェクトはApache License 2.0を採用しています。これは使用している主要ライブラリ（PyTorch、Transformers等）のライセンスとの互換性を考慮した選択です。
+ライセンス上の問題やより適切な選択肢があれば、こっそり教えてください。
 
 ## 推奨設定
 - .gitignore : Python/VSCode/OS向け公式推奨設定
 - .editorconfig : 文字コード・改行コード統一（UTF-8 LF推奨）
+
+## コーディングに使用したAI
+- GitHub Copilot Chat: Agent
+  - Claude Sonnet 4
+  - GPT-4.1
 
 ## 参考
 - PyTorch公式: https://pytorch.org/get-started/locally/
