@@ -205,6 +205,7 @@ def transcribe_long_audio(audio_file: str):
     # 1. 適応的ノイズ除去（正規化前に実行）
     audio = nr.reduce_noise(y=audio, sr=16000, stationary=False, prop_decrease=0.3)  # pyright: ignore
     audio = cast(np.ndarray, audio)  # pyright: ignore
+    audio = np.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0)
 
     # 2. 会議音声向け動的正規化（RMS正規化で音量差を保持）
     # L2正規化の代わりにRMS正規化を使用して、相対的な音量差を保持
@@ -289,6 +290,8 @@ def transcribe_long_audio(audio_file: str):
     )  # type: ignore
     print(f"検出された音声セグメント数: {len(nonsilent_ranges)}")  # type: ignore
 
+    ffmpeg_ready = _ffmpeg_available()
+
     # 会議音声向け適応的音量調整
     if nonsilent_ranges:  # 音声セグメントが存在する場合のみ
         # 各セグメントの音量を分析
@@ -305,9 +308,12 @@ def transcribe_long_audio(audio_file: str):
 
             # 小さな音声セグメントがある場合の保護処理
             if min_segment_db < -35:  # 小さな音声が検出された場合
-                # 軽微な圧縮を適用して小さな音声を持ち上げる
-                audio_segment = compress_dynamic_range(audio_segment, threshold=-35.0, ratio=3.0, attack=5.0, release=50.0)  # type: ignore
-                print(f"小さな音声検出: 軽微な圧縮を適用（{min_segment_db:.1f}dB → 改善）")
+                if ffmpeg_ready:
+                    # 軽微な圧縮を適用して小さな音声を持ち上げる
+                    audio_segment = compress_dynamic_range(audio_segment, threshold=-35.0, ratio=3.0, attack=5.0, release=50.0)  # type: ignore
+                    print(f"小さな音声検出: 軽微な圧縮を適用（{min_segment_db:.1f}dB → 改善）")
+                else:
+                    print(f"小さな音声検出: ffmpeg未検出のため圧縮をスキップ（{min_segment_db:.1f}dB）")
 
             # 全体的な音量調整（控えめに）
             current_db = audio_segment.dBFS  # type: ignore
