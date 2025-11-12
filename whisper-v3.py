@@ -79,7 +79,7 @@ model_id = "kotoba-tech/kotoba-whisper-v2.2"
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=True, trust_remote_code=True).to(device)  # type: ignore
+model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id, dtype=torch_dtype, low_cpu_mem_usage=True, trust_remote_code=True).to(device)  # type: ignore
 processor = AutoProcessor.from_pretrained(model_id)  # type: ignore
 
 print(f"GPU利用可能: {torch.cuda.is_available()}")
@@ -204,9 +204,9 @@ def transcribe_long_audio(audio_file: str):
     """長い音声を分割して処理し、結果を連結する"""
     print(f"\n=== {audio_file} ===")
 
-    # 音声を読み込み（mkvなど動画コンテナは“音声のみ”抽出）
+    # 音声を読み込み（mkvなど動画コンテナは"音声のみ"抽出）
     ext = Path(audio_file).suffix.lower()
-    is_video_container = ext in {".mkv", ".mp4", ".webm", ".mov", ".m4v"}
+    is_video_container = ext in {".mkv", ".mp4", ".webm", ".mov", ".m4v", ".flv", ".avi", ".wmv"}
     if is_video_container and has_pyav:
         print("PyAV経由で音声ストリームのみを読み込みます (in-process, 16kHz/mono)")
         try:
@@ -246,14 +246,9 @@ def transcribe_long_audio(audio_file: str):
     audio = cast(np.ndarray, audio)  # pyright: ignore
 
     # 3. pydubでの処理のためにAudioSegmentに変換（GPU対応）
-    if has_cupy and torch.cuda.is_available():
-        # GPU処理
-        audio_gpu = cp.asarray(audio)  # type: ignore
-        audio_int16 = (audio_gpu * 32767).astype(cp.int16)  # type: ignore
-        audio_int16_cpu = cp.asnumpy(audio_int16)  # type: ignore
-    else:
-        # CPU処理
-        audio_int16_cpu = (audio * 32767).astype(np.int16)  # type: ignore
+    # Use CPU numpy buffer for AudioSegment. Converting to GPU then back to CPU adds overhead
+    # and is unnecessary because AudioSegment operates on bytes in host memory.
+    audio_int16_cpu = (audio * 32767).astype(np.int16)  # type: ignore
 
     audio_segment = AudioSegment(audio_int16_cpu.tobytes(), frame_rate=16000, sample_width=2, channels=1)  # type: ignore
 
@@ -419,13 +414,9 @@ def transcribe_long_audio(audio_file: str):
             continue
 
         # numpy配列に変換（GPU対応）
-        if has_cupy and torch.cuda.is_available():
-            # GPU処理
-            chunk_samples = cp.array(chunk_segment.get_array_of_samples(), dtype=cp.float32) / 32767.0  # type: ignore
-            chunk_data = cp.asnumpy(chunk_samples)  # type: ignore
-        else:
-            # CPU処理
-            chunk_data = np.array(chunk_segment.get_array_of_samples(), dtype=np.float32) / 32767.0  # type: ignore
+        # Extract samples as numpy array on CPU. Keeping this on host memory avoids
+        # repeated GPU->CPU round trips which were present with cp.asnumpy.
+        chunk_data = np.array(chunk_segment.get_array_of_samples(), dtype=np.float32) / 32767.0  # type: ignore
 
         # 音声を処理
         inputs = processor(chunk_data, sampling_rate=16000, return_tensors="pt")  # type: ignore
