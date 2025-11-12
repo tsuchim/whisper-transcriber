@@ -25,6 +25,7 @@ from typing import cast
 import librosa
 import noisereduce as nr  # type: ignore
 import numpy as np
+from noisereduce.spectralgate import nonstationary as _nr_nonstationary
 try:
     import av  # type: ignore
 
@@ -47,6 +48,32 @@ from pydub import AudioSegment  # type: ignore
 from pydub.effects import compress_dynamic_range, normalize  # type: ignore
 from pydub.silence import detect_nonsilent  # type: ignore
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+_FLOAT_EPS = np.finfo(np.float32).eps
+
+
+if not getattr(_nr_nonstationary, "_whisper_eps_patch", False):
+    _original_get_time_smoothed = _nr_nonstationary.get_time_smoothed_representation
+
+    def _get_time_smoothed_with_eps(
+        spectral: np.ndarray,
+        samplerate: int,
+        hop_length: int,
+        time_constant_s: float = 0.001,
+    ) -> np.ndarray:
+        """Ensure smoothed spectrum never hits zero to avoid divide-by-zero."""
+
+        smoothed = _original_get_time_smoothed(
+            spectral,
+            samplerate,
+            hop_length,
+            time_constant_s=time_constant_s,
+        )
+        eps = np.finfo(smoothed.dtype).eps if np.issubdtype(smoothed.dtype, np.floating) else _FLOAT_EPS
+        return np.where(np.abs(smoothed) < eps, eps, smoothed)
+
+    _nr_nonstationary.get_time_smoothed_representation = _get_time_smoothed_with_eps
+    _nr_nonstationary._whisper_eps_patch = True
 
 model_id = "kotoba-tech/kotoba-whisper-v2.2"
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
