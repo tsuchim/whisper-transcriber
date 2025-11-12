@@ -9,3 +9,4 @@ noisereduce
 numpy<2
 pydub
 soundfile
+av

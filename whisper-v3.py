@@ -17,12 +17,21 @@ limitations under the License.
 """
 
 import sys
+import subprocess
+import shutil
 from pathlib import Path
 from typing import cast
 
 import librosa
 import noisereduce as nr  # type: ignore
 import numpy as np
+try:
+    import av  # type: ignore
+
+    has_pyav = True
+except ImportError:
+    av = None  # type: ignore
+    has_pyav = False
 
 try:
     import cupy as cp  # type: ignore
@@ -58,12 +67,137 @@ if len(sys.argv) < 2:
     sys.exit(1)
 
 
+def _ffmpeg_available() -> bool:
+    """ffmpegがPATHにあるかを確認"""
+    return shutil.which("ffmpeg") is not None
+
+
+def load_audio_via_ffmpeg(path: str, sr: int = 16000) -> np.ndarray:
+    """
+    ffmpegで動画コンテナから音声ストリームのみを抽出し、16kHz/mono/PCMで読み込む。
+    -vn でビデオ無効化、-ac 1 でモノラル、-ar でサンプリング周波数、-f s16le で16bit PCM。
+    """
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        path,
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ac",
+        "1",
+        "-ar",
+        str(sr),
+        "-f",
+        "s16le",
+        "-",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    pcm = np.frombuffer(proc.stdout, dtype=np.int16)
+    if pcm.size == 0:
+        raise ValueError("ffmpegで音声データを取得できませんでした")
+    audio = pcm.astype(np.float32) / 32767.0
+    return audio
+
+
+def load_audio_via_pyav(path: str, sr: int = 16000) -> np.ndarray:
+    """
+    PyAV(FFmpegバインディング)で動画から音声のみをデコードして16kHz/mono/PCMとして取得。
+    外部プロセスを起動せずに、FFmpegのライブラリを経由してデコードします。
+    """
+    if not has_pyav:
+        raise RuntimeError("PyAVがインストールされていません")
+    # コンテナを開く
+    with av.open(path) as container:  # type: ignore
+        # 最初の音声ストリームを選択
+        audio_stream = None
+        for s in container.streams:  # type: ignore
+            if s.type == "audio":  # type: ignore
+                audio_stream = s
+                break
+        if audio_stream is None:
+            raise ValueError("音声ストリームが見つかりませんでした")
+
+        # 16kHz/mono/16bitPCMへリサンプル
+        resampler = av.audio.resampler.AudioResampler(  # type: ignore
+            format="s16",
+            layout="mono",
+            rate=sr,
+        )
+
+        pcm_chunks: list[np.ndarray] = []
+        for packet in container.demux(audio_stream):  # type: ignore
+            for frame in packet.decode():  # type: ignore
+                # resampleの戻りは None / AudioFrame / [AudioFrame, ...] の場合がある
+                resampled = resampler.resample(frame)  # type: ignore
+
+                if resampled is None:
+                    continue
+
+                frames = resampled if isinstance(resampled, list) else [resampled]
+
+                for f in frames:
+                    # to_ndarray: shapeは(チャンネル, サンプル) もしくは (サンプル,)
+                    buf = f.to_ndarray()  # type: ignore
+                    if buf.ndim == 1:
+                        pcm = buf.astype(np.int16)
+                    else:
+                        # 念のため多chの形でもサンプル次元に揃える
+                        pcm = buf.astype(np.int16).mean(axis=0).astype(np.int16)
+                    if pcm.size:
+                        pcm_chunks.append(pcm)
+
+        # フラッシュ: 残りのサンプルを取り出す
+        try:
+            flushed = resampler.resample(None)  # type: ignore
+            if flushed is not None:
+                frames = flushed if isinstance(flushed, list) else [flushed]
+                for f in frames:
+                    buf = f.to_ndarray()  # type: ignore
+                    if buf.ndim == 1:
+                        pcm = buf.astype(np.int16)
+                    else:
+                        pcm = buf.astype(np.int16).mean(axis=0).astype(np.int16)
+                    if pcm.size:
+                        pcm_chunks.append(pcm)
+        except Exception:
+            pass
+
+        if not pcm_chunks:
+            raise ValueError("PyAVで音声データを取得できませんでした")
+
+        pcm_all = np.concatenate(pcm_chunks)
+        audio = pcm_all.astype(np.float32) / 32767.0
+        return audio
+
+
 def transcribe_long_audio(audio_file: str):
     """長い音声を分割して処理し、結果を連結する"""
     print(f"\n=== {audio_file} ===")
 
-    # 音声を読み込み
-    audio, _ = librosa.load(audio_file, sr=16000)  # type: ignore
+    # 音声を読み込み（mkvなど動画コンテナは“音声のみ”抽出）
+    ext = Path(audio_file).suffix.lower()
+    is_video_container = ext in {".mkv", ".mp4", ".webm", ".mov", ".m4v"}
+    if is_video_container and has_pyav:
+        print("PyAV経由で音声ストリームのみを読み込みます (in-process, 16kHz/mono)")
+        try:
+            audio = load_audio_via_pyav(audio_file, sr=16000)
+        except Exception as e:
+            print(f"PyAV読み込み失敗: {e}")
+            if _ffmpeg_available():
+                print("ffmpegサブプロセスにフォールバックします (-vn, 16kHz/mono)")
+                audio = load_audio_via_ffmpeg(audio_file, sr=16000)
+            else:
+                print("librosaにフォールバックします")
+                audio, _ = librosa.load(audio_file, sr=16000)  # type: ignore
+    elif is_video_container and _ffmpeg_available():
+        print("ffmpeg経由で音声ストリームのみを読み込みます (-vn, 16kHz/mono)")
+        audio = load_audio_via_ffmpeg(audio_file, sr=16000)
+    else:
+        # 非対応拡張子やffmpeg無しの場合はlibrosaにフォールバック
+        audio, _ = librosa.load(audio_file, sr=16000)  # type: ignore
 
     # 会議音声向け前処理パイプライン（動的レベル調整対応）
     print("音声を前処理中...")
@@ -147,7 +281,13 @@ def transcribe_long_audio(audio_file: str):
         min_silence_duration = 400
 
     # seek_stepを小さくして、より細かく無音を検出
-    nonsilent_ranges = detect_nonsilent(audio_segment, min_silence_len=min_silence_duration, silence_thresh=optimal_silence_thresh, seek_step=25)  # type: ignore    print(f"検出された音声セグメント数: {len(nonsilent_ranges)}")  # type: ignore
+    nonsilent_ranges = detect_nonsilent(
+        audio_segment,
+        min_silence_len=min_silence_duration,
+        silence_thresh=optimal_silence_thresh,
+        seek_step=25,
+    )  # type: ignore
+    print(f"検出された音声セグメント数: {len(nonsilent_ranges)}")  # type: ignore
 
     # 会議音声向け適応的音量調整
     if nonsilent_ranges:  # 音声セグメントが存在する場合のみ
