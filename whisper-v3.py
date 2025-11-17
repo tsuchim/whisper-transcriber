@@ -21,6 +21,8 @@ import subprocess
 import shutil
 from pathlib import Path
 from typing import cast
+import signal
+import gc
 
 import librosa
 import noisereduce as nr  # type: ignore
@@ -81,6 +83,69 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id, dtype=torch_dtype, low_cpu_mem_usage=True, trust_remote_code=True).to(device)  # type: ignore
 processor = AutoProcessor.from_pretrained(model_id)  # type: ignore
+
+# === リソースクリーンアップ関連 ===
+_CLEANED = False
+
+def _cleanup_resources():
+    """GPU/メモリ/モデルリソースを確実に解放する。
+    強制終了（SIGINT/SIGTERM）や通常終了の両方で呼ばれる。
+    """
+    global model, processor, _CLEANED
+    if _CLEANED:
+        return
+    print("[CLEANUP] 開始: リソース解放処理")
+    # 推論モデル削除
+    try:
+        del model
+    except Exception:
+        pass
+    try:
+        del processor
+    except Exception:
+        pass
+    # CuPy メモリプール解放
+    try:
+        if has_cupy and hasattr(cp, 'get_default_memory_pool'):
+            cp.get_default_memory_pool().free_all_blocks()  # type: ignore
+            print("[CLEANUP] CuPy メモリプール解放")
+    except Exception as e:
+        print(f"[CLEANUP] CuPy 解放失敗: {e}")
+    # Torch GPU キャッシュ解放
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print("[CLEANUP] torch.cuda.empty_cache 実行")
+    except Exception as e:
+        print(f"[CLEANUP] torch キャッシュ解放失敗: {e}")
+    # ガベージコレクション明示実行
+    try:
+        gc.collect()
+        print("[CLEANUP] gc.collect 実行")
+    except Exception:
+        pass
+    _CLEANED = True
+    print("[CLEANUP] 完了")
+
+def _signal_handler(signum, frame):
+    """SIGINT/SIGTERM を捕捉して安全に終了"""
+    print(f"[CLEANUP] シグナル受信: {signum}. クリーンアップを実行して終了します")
+    _cleanup_resources()
+    # シグナルコードを反映した終了ステータス (POSIX 慣例)
+    try:
+        sys.exit(128 + signum)
+    except SystemExit:
+        raise
+
+# Windows 環境では SIGTERM が無い場合があるので存在確認
+try:
+    signal.signal(signal.SIGINT, _signal_handler)
+except Exception:
+    pass
+try:
+    signal.signal(signal.SIGTERM, _signal_handler)  # type: ignore
+except Exception:
+    pass
 
 print(f"GPU利用可能: {torch.cuda.is_available()}")
 print(f"transformers device: {device}")
@@ -464,12 +529,15 @@ def transcribe_long_audio(audio_file: str):
     return full_transcription  # type: ignore
 
 
-# 各音声ファイルを処理
-for audio_file in sys.argv[1:]:
-    try:
-        transcribe_long_audio(audio_file)
-    except Exception as e:  # type: ignore
-        print(f"エラー: {audio_file} の処理中にエラーが発生しました: {e}")
+# 各音声ファイルを処理（終了時クリーンアップ保証）
+try:
+    for audio_file in sys.argv[1:]:
+        try:
+            transcribe_long_audio(audio_file)
+        except Exception as e:  # type: ignore
+            print(f"エラー: {audio_file} の処理中にエラーが発生しました: {e}")
+finally:
+    _cleanup_resources()
 
 """
 会議音声向け前処理パイプラインの実装根拠：
