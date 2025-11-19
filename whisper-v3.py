@@ -522,6 +522,7 @@ def transcribe_long_audio(audio_file: str):
         print(f"出力先: {output_file}")
     except Exception as e:
         print(f"ファイル保存エラー: {e}")
+        raise  # Re-raise to ensure non-zero exit code
 
     print(f"\n=== 完全な転写結果 ===")  # type: ignore
     print(full_transcription)  # type: ignore
@@ -530,14 +531,21 @@ def transcribe_long_audio(audio_file: str):
 
 
 # 各音声ファイルを処理（終了時クリーンアップ保証）
+failed_files = []
 try:
     for audio_file in sys.argv[1:]:
         try:
             transcribe_long_audio(audio_file)
         except Exception as e:  # type: ignore
             print(f"エラー: {audio_file} の処理中にエラーが発生しました: {e}")
+            failed_files.append(audio_file)
 finally:
     _cleanup_resources()
+
+# 一つでも失敗があれば非ゼロで終了
+if failed_files:
+    print(f"\n失敗したファイル ({len(failed_files)}件): {', '.join(failed_files)}")
+    sys.exit(1)
 
 """
 会議音声向け前処理パイプラインの実装根拠：
