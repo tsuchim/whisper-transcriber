@@ -265,9 +265,40 @@ def load_audio_via_pyav(path: str, sr: int = 16000) -> np.ndarray:
         return audio
 
 
+def _build_prompt_from_env() -> str:
+    """
+    環境変数から Whisper 用プロンプト文字列を構築
+    
+    WHISPER_CHANNEL_NAME: 配信者名
+    WHISPER_KEYWORDS: カンマ区切りのキーワード
+    
+    Returns:
+        プロンプト文字列（空の場合は空文字列）
+    """
+    import os
+    parts = []
+    
+    channel_name = os.environ.get("WHISPER_CHANNEL_NAME", "").strip()
+    if channel_name:
+        parts.append(f"配信者: {channel_name}")
+    
+    keywords = os.environ.get("WHISPER_KEYWORDS", "").strip()
+    if keywords:
+        parts.append(f"キーワード: {keywords}")
+    
+    if parts:
+        return "。".join(parts) + "。"
+    return ""
+
+
 def transcribe_long_audio(audio_file: str):
     """長い音声を分割して処理し、結果を連結する"""
     print(f"\n=== {audio_file} ===")
+    
+    # 環境変数からプロンプトを構築
+    prompt = _build_prompt_from_env()
+    if prompt:
+        print(f"プロンプト: {prompt}")
 
     # 音声を読み込み（mkvなど動画コンテナは"音声のみ"抽出）
     ext = Path(audio_file).suffix.lower()
@@ -466,6 +497,18 @@ def transcribe_long_audio(audio_file: str):
 
     print(f"処理用チャンク数: {len(chunks)}")  # type: ignore
 
+    # プロンプトからprompt_idsを生成
+    prompt_ids = None
+    if prompt:
+        try:
+            # Whisper tokenizer でプロンプトをトークン化
+            prompt_ids = processor.tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt")  # type: ignore
+            prompt_ids = prompt_ids.to(device)  # type: ignore
+            print(f"prompt_ids shape: {prompt_ids.shape}")  # type: ignore
+        except Exception as e:
+            print(f"プロンプトトークン化エラー（無視して続行）: {e}")
+            prompt_ids = None
+
     transcriptions = []  # type: ignore
 
     for i, (start_ms, end_ms) in enumerate(chunks):  # type: ignore
@@ -488,17 +531,26 @@ def transcribe_long_audio(audio_file: str):
         input_features = inputs.input_features.to(device).to(torch_dtype)  # type: ignore
 
         with torch.no_grad():
+            # generate 引数を構築
+            generate_kwargs = {
+                "language": "ja",
+                "task": "transcribe",
+                "do_sample": False,
+                "temperature": 0.0,
+                "no_repeat_ngram_size": 0,
+                "use_cache": True,
+                "suppress_tokens": None,  # 抑制トークンを無効化
+                "num_beams": 1,  # ビームサーチを無効化して感度向上
+                "repetition_penalty": 1.0,  # 繰り返しペナルティを無効化
+            }
+            
+            # プロンプトがある場合は prompt_ids を追加
+            if prompt_ids is not None:
+                generate_kwargs["prompt_ids"] = prompt_ids
+            
             generated_tokens = model.generate(  # pyright: ignore
                 input_features,
-                language="ja",
-                task="transcribe",
-                do_sample=False,
-                temperature=0.0,
-                no_repeat_ngram_size=0,
-                use_cache=True,
-                suppress_tokens=None,  # 抑制トークンを無効化
-                num_beams=1,  # ビームサーチを無効化して感度向上
-                repetition_penalty=1.0,  # 繰り返しペナルティを無効化
+                **generate_kwargs
             )
             generated_tokens = cast(torch.Tensor, generated_tokens)  # pyright: ignore
 
