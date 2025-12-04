@@ -23,6 +23,11 @@ from pathlib import Path
 from typing import cast
 import signal
 import gc
+import io
+
+# Windows cp932エンコーディングエラー回避: UTF-8で出力し、エンコード不可文字は置換
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import librosa
 import noisereduce as nr  # type: ignore
@@ -502,8 +507,9 @@ def transcribe_long_audio(audio_file: str):
     if prompt:
         try:
             # Whisper tokenizer でプロンプトをトークン化
+            # transformers 4.57+では prompt_ids は Rank-1 テンソル（1次元）が必要
             prompt_ids = processor.tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt")  # type: ignore
-            prompt_ids = prompt_ids.to(device)  # type: ignore
+            prompt_ids = prompt_ids.squeeze(0).to(device)  # 2次元→1次元に変換してからGPUへ
             print(f"prompt_ids shape: {prompt_ids.shape}")  # type: ignore
         except Exception as e:
             print(f"プロンプトトークン化エラー（無視して続行）: {e}")
