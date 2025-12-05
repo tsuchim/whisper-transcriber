@@ -20,10 +20,11 @@ import sys
 import subprocess
 import shutil
 from pathlib import Path
-from typing import cast
+from typing import cast, Optional
 import signal
 import gc
 import io
+import argparse
 
 # Windows cp932エンコーディングエラー回避: UTF-8で出力し、エンコード不可文字は置換
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -270,38 +271,76 @@ def load_audio_via_pyav(path: str, sr: int = 16000) -> np.ndarray:
         return audio
 
 
-def _build_prompt_from_env() -> str:
+def _parse_args() -> argparse.Namespace:
     """
-    環境変数から Whisper 用プロンプト文字列を構築
-    
-    WHISPER_CHANNEL_NAME: 配信者名
-    WHISPER_KEYWORDS: カンマ区切りのキーワード
+    コマンドライン引数を解析
     
     Returns:
-        プロンプト文字列（空の場合は空文字列）
+        解析された引数のNamespace
     """
-    import os
-    parts = []
+    parser = argparse.ArgumentParser(
+        description='音声/動画ファイルを日本語で文字起こしします (kotoba-whisper-v2.2)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用例:
+  %(prog)s audio.mp3
+  %(prog)s video.mp4 --prompt "配信者: 山田太郎。キーワード: ゲーム配信"
+  %(prog)s audio.flv --header "配信: 山田太郎\\n日時: 2025-01-01 12:00" --output /path/to/output.txt
+"""
+    )
+    parser.add_argument(
+        'audio_files',
+        nargs='+',
+        help='文字起こしする音声/動画ファイル（複数指定可）'
+    )
+    parser.add_argument(
+        '--prompt', '-p',
+        type=str,
+        default=None,
+        help='AIに渡すプロンプト文字列（文脈情報、話者名など）'
+    )
+    parser.add_argument(
+        '--header', '-H',
+        type=str,
+        default=None,
+        help=r'出力ファイルの冒頭に付加するヘッダ文字列（\n で改行）'
+    )
+    parser.add_argument(
+        '--output', '-o',
+        type=str,
+        default=None,
+        help='出力ファイルパス（単一ファイル処理時のみ有効）'
+    )
     
-    channel_name = os.environ.get("WHISPER_CHANNEL_NAME", "").strip()
-    if channel_name:
-        parts.append(f"配信者: {channel_name}")
+    args = parser.parse_args()
     
-    keywords = os.environ.get("WHISPER_KEYWORDS", "").strip()
-    if keywords:
-        parts.append(f"キーワード: {keywords}")
+    # --output は単一ファイル時のみ有効
+    if args.output and len(args.audio_files) > 1:
+        parser.error('--output は単一ファイル処理時のみ指定できます')
     
-    if parts:
-        return "。".join(parts) + "。"
-    return ""
+    return args
 
 
-def transcribe_long_audio(audio_file: str):
-    """長い音声を分割して処理し、結果を連結する"""
+def transcribe_long_audio(
+    audio_file: str,
+    prompt: Optional[str] = None,
+    header: Optional[str] = None,
+    output_path: Optional[str] = None,
+) -> str:
+    """
+    長い音声を分割して処理し、結果を連結する
+    
+    Args:
+        audio_file: 音声/動画ファイルのパス
+        prompt: AIに渡すプロンプト文字列（任意）
+        header: 出力ファイルの冒頭に付加するヘッダ（任意）
+        output_path: 出力ファイルパス（Noneの場合は入力ファイルと同じ場所に .txt）
+    
+    Returns:
+        文字起こし結果のテキスト
+    """
     print(f"\n=== {audio_file} ===")
     
-    # 環境変数からプロンプトを構築
-    prompt = _build_prompt_from_env()
     if prompt:
         print(f"プロンプト: {prompt}")
 
@@ -569,9 +608,17 @@ def transcribe_long_audio(audio_file: str):
     # 全てのチャンクの結果を連結（改行区切り）
     full_transcription = "\n".join(transcriptions)  # type: ignore
 
+    # ヘッダを付加（\\n を実際の改行に変換）
+    if header:
+        header_text = header.replace('\\n', '\n')
+        full_transcription = header_text + "\n\n" + full_transcription
+
     # テキストファイルに出力
     audio_path = Path(audio_file)
-    output_file = audio_path.with_suffix('.txt')
+    if output_path:
+        output_file = Path(output_path)
+    else:
+        output_file = audio_path.with_suffix('.txt')
 
     try:
         with open(output_file, 'w', encoding='utf-8') as f:
@@ -588,22 +635,33 @@ def transcribe_long_audio(audio_file: str):
     return full_transcription  # type: ignore
 
 
-# 各音声ファイルを処理（終了時クリーンアップ保証）
-failed_files = []
-try:
-    for audio_file in sys.argv[1:]:
-        try:
-            transcribe_long_audio(audio_file)
-        except Exception as e:  # type: ignore
-            print(f"エラー: {audio_file} の処理中にエラーが発生しました: {e}")
-            failed_files.append(audio_file)
-finally:
-    _cleanup_resources()
+# メイン実行
+if __name__ == "__main__":
+    args = _parse_args()
+    
+    # 各音声ファイルを処理（終了時クリーンアップ保証）
+    failed_files = []
+    try:
+        for i, audio_file in enumerate(args.audio_files):
+            try:
+                # 複数ファイル時は --output は使用不可（argparseでバリデーション済み）
+                output_path = args.output if len(args.audio_files) == 1 else None
+                transcribe_long_audio(
+                    audio_file,
+                    prompt=args.prompt,
+                    header=args.header,
+                    output_path=output_path,
+                )
+            except Exception as e:  # type: ignore
+                print(f"エラー: {audio_file} の処理中にエラーが発生しました: {e}")
+                failed_files.append(audio_file)
+    finally:
+        _cleanup_resources()
 
-# 一つでも失敗があれば非ゼロで終了
-if failed_files:
-    print(f"\n失敗したファイル ({len(failed_files)}件): {', '.join(failed_files)}")
-    sys.exit(1)
+    # 一つでも失敗があれば非ゼロで終了
+    if failed_files:
+        print(f"\n失敗したファイル ({len(failed_files)}件): {', '.join(failed_files)}")
+        sys.exit(1)
 
 """
 会議音声向け前処理パイプラインの実装根拠：

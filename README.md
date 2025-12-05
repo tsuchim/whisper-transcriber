@@ -4,6 +4,36 @@
 CUDA12.1 + Python3.12環境で動作する高速音声認識ツールです。
 Whisper v3ベースでGPU/CPU自動判定、ノイズ除去、音声前処理に対応。
 
+## 使い方
+
+### 基本
+```bash
+python whisper-v3.py audio.mp3
+python whisper-v3.py video.mp4 video2.flv  # 複数ファイル対応
+```
+
+### オプション
+| オプション | 短縮形 | 説明 |
+|-----------|--------|------|
+| `--prompt` | `-p` | AIに渡すプロンプト文字列（文脈情報、話者名など） |
+| `--header` | `-H` | 出力ファイルの冒頭に付加するヘッダー（`\n` で改行） |
+| `--output` | `-o` | 出力ファイルパス（単一ファイル処理時のみ有効） |
+
+### 使用例
+```bash
+# 基本的な文字起こし
+python whisper-v3.py audio.mp3
+
+# プロンプトを指定（AIの精度向上）
+python whisper-v3.py video.mp4 --prompt "配信者: 山田太郎。キーワード: ゲーム配信"
+
+# ヘッダー付きで出力
+python whisper-v3.py audio.flv --header "配信: 山田太郎\n日時: 2025-01-01 12:00"
+
+# 出力ファイルを指定
+python whisper-v3.py audio.flv --output /path/to/output.txt
+```
+
 ## インストール手順
 1. Python 3.12.x環境を用意
 2. CUDA 12.1対応GPUドライバをインストール
