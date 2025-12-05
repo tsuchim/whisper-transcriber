@@ -192,7 +192,15 @@ def load_audio_via_ffmpeg(path: str, sr: int = 16000) -> np.ndarray:
         "s16le",
         "-",
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    startupinfo = None
+    creationflags = 0
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        creationflags = subprocess.CREATE_NO_WINDOW
+
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, startupinfo=startupinfo, creationflags=creationflags)
     pcm = np.frombuffer(proc.stdout, dtype=np.int16)
     if pcm.size == 0:
         raise ValueError("ffmpegで音声データを取得できませんでした")
