@@ -31,9 +31,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='repla
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import librosa
-import noisereduce as nr  # type: ignore
 import numpy as np
-from noisereduce.spectralgate import nonstationary as _nr_nonstationary
 try:
     import av  # type: ignore
 
@@ -53,39 +51,38 @@ except ImportError:
     print("CuPy が見つかりません。CPUでnumpyを使用します")
 import torch
 from pydub import AudioSegment  # type: ignore
-from pydub.effects import compress_dynamic_range, normalize  # type: ignore
-from pydub.silence import detect_nonsilent  # type: ignore
+from pydub.effects import compress_dynamic_range  # type: ignore
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
+# Silero VAD for fast voice activity detection
+try:
+    _vad_model, _vad_utils = torch.hub.load(
+        repo_or_dir='snakers4/silero-vad',
+        model='silero_vad',
+        trust_repo=True,
+        verbose=False
+    )
+    _get_speech_timestamps, _, _read_audio, _, _ = _vad_utils
+    has_silero_vad = True
+    print("Silero VAD が利用可能です（高速音声検出）")
+except Exception as e:
+    has_silero_vad = False
+    print(f"Silero VAD 読み込み失敗: {e}（pydubフォールバック）")
+    from pydub.silence import detect_nonsilent  # type: ignore
+
 _FLOAT_EPS = np.finfo(np.float32).eps
-
-
-if not getattr(_nr_nonstationary, "_whisper_eps_patch", False):
-    _original_get_time_smoothed = _nr_nonstationary.get_time_smoothed_representation
-
-    def _get_time_smoothed_with_eps(
-        spectral: np.ndarray,
-        samplerate: int,
-        hop_length: int,
-        time_constant_s: float = 0.001,
-    ) -> np.ndarray:
-        """Ensure smoothed spectrum never hits zero to avoid divide-by-zero."""
-
-        smoothed = _original_get_time_smoothed(
-            spectral,
-            samplerate,
-            hop_length,
-            time_constant_s=time_constant_s,
-        )
-        eps = np.finfo(smoothed.dtype).eps if np.issubdtype(smoothed.dtype, np.floating) else _FLOAT_EPS
-        return np.where(np.abs(smoothed) < eps, eps, smoothed)
-
-    _nr_nonstationary.get_time_smoothed_representation = _get_time_smoothed_with_eps
-    _nr_nonstationary._whisper_eps_patch = True
 
 model_id = "kotoba-tech/kotoba-whisper-v2.2"
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# GPU利用可能なら Silero VAD モデルを GPU に移動
+if has_silero_vad and torch.cuda.is_available():
+    try:
+        _vad_model = _vad_model.to(device)
+        print("Silero VAD モデルを GPU に移動しました")
+    except Exception as e:
+        print(f"Silero VAD GPU移動失敗（CPU使用）: {e}")
 
 model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id, dtype=torch_dtype, low_cpu_mem_usage=True, trust_remote_code=True).to(device)  # type: ignore
 processor = AutoProcessor.from_pretrained(model_id)  # type: ignore
@@ -133,6 +130,58 @@ def _cleanup_resources():
     _CLEANED = True
     print("[CLEANUP] 完了")
 
+
+def offload_model():
+    """モデルをCPUに退避し、VRAMを解放する（他のアプリにGPUを譲るため）"""
+    global model, _vad_model
+    print("[RESOURCE] モデルをCPUに退避中...")
+    try:
+        if 'model' in globals() and model is not None:
+            model.to("cpu")
+    except Exception as e:
+        print(f"Whisperモデル退避失敗: {e}")
+
+    try:
+        if has_silero_vad and 'vad_model' in globals() and _vad_model is not None:
+            _vad_model.to("cpu")
+    except Exception as e:
+        # _vad_model might not be defined if init failed
+        pass
+        
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    print("[RESOURCE] VRAM解放完了 (CPU待機状態)")
+
+
+def restore_model():
+    """モデルをGPUに復帰させる（処理開始前）"""
+    global model, _vad_model
+    if not torch.cuda.is_available():
+        return
+
+    # 既にGPUにあるか確認（簡易チェック）
+    try:
+        if 'model' in globals() and model is not None and next(model.parameters()).device.type == 'cuda':
+            return
+    except Exception:
+        pass
+
+    print("[RESOURCE] モデルをGPUに復帰中...")
+    try:
+        if 'model' in globals() and model is not None:
+            model.to(device)
+    except Exception as e:
+        print(f"Whisperモデル復帰失敗: {e}")
+
+    try:
+        if has_silero_vad and 'vad_model' in globals() and _vad_model is not None:
+            _vad_model.to(device)
+    except Exception as e:
+        pass
+    print("[RESOURCE] GPU復帰完了")
+
+
 def _signal_handler(signum, frame):
     """SIGINT/SIGTERM を捕捉して安全に終了"""
     print(f"[CLEANUP] シグナル受信: {signum}. クリーンアップを実行して終了します")
@@ -159,10 +208,6 @@ if has_cupy and torch.cuda.is_available():
     print(f"CuPy GPU acceleration: 有効")
 else:
     print(f"CuPy GPU acceleration: 無効 (CPU処理)")
-
-if len(sys.argv) < 2:
-    print("使い方: python transcribe.py audio1.mp3 audio2.wav ...")
-    sys.exit(1)
 
 
 def _ffmpeg_available() -> bool:
@@ -374,180 +419,159 @@ def transcribe_long_audio(
         # 非対応拡張子やffmpeg無しの場合はlibrosaにフォールバック
         audio, _ = librosa.load(audio_file, sr=16000)  # type: ignore
 
-    # 会議音声向け前処理パイプライン（動的レベル調整対応）
-    print("音声を前処理中...")
+    # === 高速前処理パイプライン（Silero VAD + 軽量正規化） ===
+    import time as _time
+    audio_duration_sec = len(audio) / 16000
+    print(f"[PROGRESS] 音声読み込み完了: {audio_duration_sec:.1f}秒 ({audio_duration_sec/60:.1f}分)")
+    print(f"[PROGRESS] 前処理開始... (GPU: {torch.cuda.is_available()}, デバイス: {device})")
+    _preprocess_start = _time.time()
 
-    # 1. 適応的ノイズ除去（正規化前に実行）
-    audio = nr.reduce_noise(y=audio, sr=16000, stationary=False, prop_decrease=0.3)  # pyright: ignore
-    audio = cast(np.ndarray, audio)  # pyright: ignore
+    # 1. NaN/Inf をクリーンアップ（必須）
     audio = np.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0)
 
-    # 2. 会議音声向け動的正規化（RMS正規化で音量差を保持）
-    # L2正規化の代わりにRMS正規化を使用して、相対的な音量差を保持
+    # 2. 高速RMS正規化（ベクトル演算）
     rms = np.sqrt(np.mean(audio**2))
     if rms > 0:
-        # 目標RMSレベル: -20dBFS相当
         target_rms = 0.1  # 約-20dBFS
         audio = audio * (target_rms / rms)
-        # クリッピング防止
         audio = np.clip(audio, -1.0, 1.0)
-    audio = cast(np.ndarray, audio)  # pyright: ignore
+    audio = cast(np.ndarray, audio)
 
-    # 3. pydubでの処理のためにAudioSegmentに変換（GPU対応）
-    # Use CPU numpy buffer for AudioSegment. Converting to GPU then back to CPU adds overhead
-    # and is unnecessary because AudioSegment operates on bytes in host memory.
-    audio_int16_cpu = (audio * 32767).astype(np.int16)  # type: ignore
-
-    audio_segment = AudioSegment(audio_int16_cpu.tobytes(), frame_rate=16000, sample_width=2, channels=1)  # type: ignore
-
-    # 4. 会議音声向け適応的音量分析
-    print("音声を分析中...")
-
-    # 短時間窓での音量分析（500ms窓で細かく分析）
-    window_size = 500  # 500ms窓
-    audio_rms_chunks = []
-    for i in range(0, len(audio_segment), window_size):
-        chunk = audio_segment[i : i + window_size]
-        if len(chunk) > 100 and chunk.dBFS > -float('inf'):  # type: ignore
-            audio_rms_chunks.append(chunk.dBFS)  # type: ignore
-
-    if audio_rms_chunks:
-        min_db = min(audio_rms_chunks)
-        max_db = max(audio_rms_chunks)
-        avg_db = sum(audio_rms_chunks) / len(audio_rms_chunks)
-
-        print(f"音声分析結果: 最小={min_db:.1f}dB, 最大={max_db:.1f}dB, 平均={avg_db:.1f}dB, 音量差={max_db-min_db:.1f}dB")
-
-        # 会議音声向け適応的閾値：実際の無音部分を正確に検出
-        volume_range = max_db - min_db
-        if volume_range > 20:  # 音量差が20dB以上の場合（会議音声の特徴）
-            # より厳格な無音検出：統計的アプローチで真の無音を検出
-            # 音量の下位5%を無音候補として、そこから閾値を設定
-            sorted_chunks = sorted(audio_rms_chunks)
-            percentile_5 = sorted_chunks[max(0, len(sorted_chunks) // 20)]  # 下位5%
-            percentile_15 = sorted_chunks[max(0, len(sorted_chunks) // 7)]  # 下位15%
-
-            # より積極的な分割のため、閾値を緩める
-            optimal_silence_thresh = max(-70, min(percentile_5 + 8, percentile_15))
-            print(f"会議音声モード: 音量差{volume_range:.1f}dB、積極的分割({percentile_5:.1f}dB基準)")
-            print(f"下位5%値: {percentile_5:.1f}dB, 下位15%値: {percentile_15:.1f}dB")
+    # 3. Silero VAD で高速音声区間検出（音量非依存、小さな声も検出）
+    _vad_start = _time.time()
+    
+    if has_silero_vad:
+        # Silero VAD は torch.Tensor を期待
+        audio_tensor = torch.from_numpy(audio).float()
+        
+        # GPU利用可能なら GPU に移動
+        if torch.cuda.is_available():
+            audio_tensor = audio_tensor.to(device)
+            print(f"[PROGRESS] Silero VAD 実行中 (GPU: {device})...")
         else:
-            # 通常の2σ法
-            std_db = (sum([(x - avg_db) ** 2 for x in audio_rms_chunks]) / len(audio_rms_chunks)) ** 0.5
-            optimal_silence_thresh = max(-60, avg_db - 2 * std_db)
-
-        print(f"最適な無音閾値: {optimal_silence_thresh:.1f}dB")
+            print("[PROGRESS] Silero VAD 実行中 (CPU)...")
+        
+        # 高感度設定: threshold を下げて小さな声も漏れなく検出
+        speech_timestamps = _get_speech_timestamps(
+            audio_tensor,
+            _vad_model,
+            threshold=0.3,               # デフォルト0.5→0.3で感度UP
+            min_speech_duration_ms=100,  # 100ms以上の発話を検出
+            min_silence_duration_ms=150, # 150msの無音で分割（細かく）
+            speech_pad_ms=100,           # 発話前後に100msのマージン
+            return_seconds=False,        # サンプル単位で返す
+        )
+        
+        # サンプル単位 → ミリ秒単位に変換
+        nonsilent_ranges = []
+        for ts in speech_timestamps:
+            start_ms = int(ts['start'] / 16)  # 16kHz → ms
+            end_ms = int(ts['end'] / 16)
+            nonsilent_ranges.append((start_ms, end_ms))
+        
+        _vad_time = _time.time() - _vad_start
+        print(f"[PROGRESS] Silero VAD 完了: {len(nonsilent_ranges)} セグメント検出, {_vad_time:.2f}秒")
     else:
-        optimal_silence_thresh = -50  # デフォルト値
-        print("音声分析失敗、デフォルト値-50dBを使用")
+        # フォールバック: pydub の detect_nonsilent（遅い）
+        print("[PROGRESS] 警告: Silero VAD 利用不可 → pydub (低速)")
+        audio_int16 = (audio * 32767).astype(np.int16)
+        audio_segment_fallback = AudioSegment(audio_int16.tobytes(), frame_rate=16000, sample_width=2, channels=1)
+        nonsilent_ranges = detect_nonsilent(
+            audio_segment_fallback,
+            min_silence_len=400,
+            silence_thresh=-50,
+            seek_step=25,
+        )
+        print(f"pydub: {len(nonsilent_ranges)} 個の音声セグメントを検出")
 
-    print("無音検出で音声を分割中...")
+    # 4. pydubでの処理のためにAudioSegmentに変換
+    audio_int16_cpu = (audio * 32767).astype(np.int16)
+    audio_segment = AudioSegment(audio_int16_cpu.tobytes(), frame_rate=16000, sample_width=2, channels=1)
+    audio_length_ms = len(audio_segment)
 
-    # 会議音声向け無音検出（積極的分割で長時間チャンク回避）
-    if audio_rms_chunks:
-        volume_range = max(audio_rms_chunks) - min(audio_rms_chunks)
-        # より短い無音でも分割して、確実に処理可能なサイズにする
-        min_silence_duration = 600 if volume_range > 20 else 400  # 600ms/400msの無音で分割
-    else:
-        min_silence_duration = 400
-
-    # seek_stepを小さくして、より細かく無音を検出
-    nonsilent_ranges = detect_nonsilent(
-        audio_segment,
-        min_silence_len=min_silence_duration,
-        silence_thresh=optimal_silence_thresh,
-        seek_step=25,
-    )  # type: ignore
-    print(f"検出された音声セグメント数: {len(nonsilent_ranges)}")  # type: ignore
-
+    # 5. セグメント毎の音量分析と小さな音声の増幅（高速ベクトル演算）
     ffmpeg_ready = _ffmpeg_available()
-
-    # 会議音声向け適応的音量調整
-    if nonsilent_ranges:  # 音声セグメントが存在する場合のみ
-        # 各セグメントの音量を分析
-        segment_volumes = []
-        for start_ms, end_ms in nonsilent_ranges:  # type: ignore
-            segment = audio_segment[start_ms:end_ms]  # type: ignore
-            if len(segment) > 100:  # type: ignore
-                segment_volumes.append(segment.dBFS)  # type: ignore
-
-        if segment_volumes:
-            min_segment_db = min(segment_volumes)
-            max_segment_db = max(segment_volumes)
-            avg_segment_db = sum(segment_volumes) / len(segment_volumes)
-
+    
+    if nonsilent_ranges:
+        # 各セグメントのRMSを高速計算
+        segment_rms_list = []
+        for start_ms, end_ms in nonsilent_ranges:
+            start_sample = int(start_ms * 16)
+            end_sample = min(int(end_ms * 16), len(audio))
+            if end_sample > start_sample:
+                seg_audio = audio[start_sample:end_sample]
+                seg_rms = np.sqrt(np.mean(seg_audio**2))
+                if seg_rms > 0:
+                    seg_db = 20 * np.log10(seg_rms)
+                    segment_rms_list.append(seg_db)
+        
+        if segment_rms_list:
+            min_seg_db = min(segment_rms_list)
+            max_seg_db = max(segment_rms_list)
+            print(f"セグメント音量: 最小={min_seg_db:.1f}dB, 最大={max_seg_db:.1f}dB, 差={max_seg_db-min_seg_db:.1f}dB")
+            
             # 小さな音声セグメントがある場合の保護処理
-            if min_segment_db < -35:  # 小さな音声が検出された場合
-                if ffmpeg_ready:
-                    # 軽微な圧縮を適用して小さな音声を持ち上げる
-                    audio_segment = compress_dynamic_range(audio_segment, threshold=-35.0, ratio=3.0, attack=5.0, release=50.0)  # type: ignore
-                    print(f"小さな音声検出: 軽微な圧縮を適用（{min_segment_db:.1f}dB → 改善）")
-                else:
-                    print(f"小さな音声検出: ffmpeg未検出のため圧縮をスキップ（{min_segment_db:.1f}dB）")
+            if min_seg_db < -35 and ffmpeg_ready:
+                audio_segment = compress_dynamic_range(
+                    audio_segment, threshold=-35.0, ratio=3.0, attack=5.0, release=50.0
+                )
+                print(f"小さな音声保護: 軽微な圧縮を適用（{min_seg_db:.1f}dB）")
 
-            # 全体的な音量調整（控えめに）
-            current_db = audio_segment.dBFS  # type: ignore
-            target_db = -18  # 会議音声向けやや高めの目標レベル
-            if current_db < -25:  # 全体的に小さい場合のみ
-                adjustment = min(4, target_db - current_db)  # 最大4dBまで
-                audio_segment = audio_segment + adjustment  # type: ignore
-                print(f"全体音量調整: {adjustment:.1f}dB 上昇（{current_db:.1f}dB → {audio_segment.dBFS:.1f}dB）")  # type: ignore
+    # 6. 冒頭・末尾の取りこぼし対策 + 長時間セグメント分割
+    max_chunk_ms = 25000  # 25秒（Whisperに適したサイズ）
+    processed_ranges = []
 
-    # 無音でない部分を適切な長さにまとめる（積極的分割で処理性能向上）
-    max_chunk_ms = 20000  # 20秒に短縮（より積極的に分割）
-    chunks = []  # type: ignore
+    # 冒頭対策
+    if nonsilent_ranges and nonsilent_ranges[0][0] > 500:
+        processed_ranges.append((0, nonsilent_ranges[0][0]))
+        print(f"冒頭追加: 0-{nonsilent_ranges[0][0]}ms")
 
-    # 冒頭の取りこぼし対策：音声開始から最初の無音区間前までを追加
-    if nonsilent_ranges and nonsilent_ranges[0][0] > 1000:  # 最初のセグメントが1秒以降から始まる場合
-        print(f"冒頭音声検出: 0s-{nonsilent_ranges[0][0]/1000:.1f}sを追加")
-        processed_ranges = [(0, nonsilent_ranges[0][0])]  # 冒頭部分を追加
-    else:
-        processed_ranges = []
-
-    # 20秒を超える単一セグメントは強制分割
-    for start_ms, end_ms in nonsilent_ranges:  # type: ignore
+    # 各セグメントを処理
+    for start_ms, end_ms in nonsilent_ranges:
         duration = end_ms - start_ms
-        if duration > 20000:  # 20秒を超える場合
-            print(f"長時間セグメント検出({duration/1000:.1f}s): 強制分割します")
-            # 15秒ずつに分割（オーバーラップ有り）
-            current_start = start_ms
-            while current_start < end_ms:
-                current_end = min(current_start + 15000, end_ms)
-                if current_end - current_start >= 1000:  # 1秒以上のセグメントのみ
-                    processed_ranges.append((current_start, current_end))
-                current_start += 12000  # 3秒オーバーラップ
+        if duration > 20000:
+            # 長時間セグメントは15秒ずつに分割（3秒オーバーラップ）
+            current = start_ms
+            while current < end_ms:
+                seg_end = min(current + 15000, end_ms)
+                if seg_end - current >= 500:
+                    processed_ranges.append((current, seg_end))
+                current += 12000
         else:
             processed_ranges.append((start_ms, end_ms))
 
-    # 末尾の取りこぼし対策：最後のセグメント後から音声終了までを追加
-    audio_length_ms = len(audio_segment)
-    if nonsilent_ranges and nonsilent_ranges[-1][1] < audio_length_ms - 1000:  # 最後のセグメントと音声終了に1秒以上の差がある場合
-        print(f"末尾音声検出: {nonsilent_ranges[-1][1]/1000:.1f}s-{audio_length_ms/1000:.1f}sを追加")
+    # 末尾対策
+    if nonsilent_ranges and nonsilent_ranges[-1][1] < audio_length_ms - 500:
         processed_ranges.append((nonsilent_ranges[-1][1], audio_length_ms))
+        print(f"末尾追加: {nonsilent_ranges[-1][1]}-{audio_length_ms}ms")
 
-    # 分割されたセグメントをチャンクにまとめる
-    current_chunk_start = None  # type: ignore
-    current_chunk_end = None  # type: ignore
+    # 7. チャンクにまとめる（隣接セグメントを結合）
+    chunks = []
+    current_start = None
+    current_end = None
 
-    for start_ms, end_ms in processed_ranges:  # type: ignore
-        if current_chunk_start is None:
-            current_chunk_start = start_ms  # type: ignore
-            current_chunk_end = end_ms  # type: ignore
+    for start_ms, end_ms in processed_ranges:
+        if current_start is None:
+            current_start = start_ms
+            current_end = end_ms
+        elif (end_ms - current_start) <= max_chunk_ms:
+            current_end = end_ms
         else:
-            # 現在のチャンクに追加できるかチェック
-            if (end_ms - current_chunk_start) <= max_chunk_ms:  # type: ignore
-                current_chunk_end = end_ms  # type: ignore
-            else:
-                # 現在のチャンクを完了して新しいチャンクを開始
-                chunks.append((current_chunk_start, current_chunk_end))  # type: ignore
-                current_chunk_start = start_ms  # type: ignore
-                current_chunk_end = end_ms  # type: ignore
+            chunks.append((current_start, current_end))
+            current_start = start_ms
+            current_end = end_ms
 
-    # 最後のチャンクを追加
-    if current_chunk_start is not None:
-        chunks.append((current_chunk_start, current_chunk_end))  # type: ignore
+    if current_start is not None:
+        chunks.append((current_start, current_end))
 
-    print(f"処理用チャンク数: {len(chunks)}")  # type: ignore
+    _preprocess_time = _time.time() - _preprocess_start
+    total_speech_sec = sum((e - s) / 1000 for s, e in chunks)
+    print(f"[PROGRESS] ========================================")
+    print(f"[PROGRESS] 前処理完了: {_preprocess_time:.2f}秒")
+    print(f"[PROGRESS] チャンク数: {len(chunks)}, 音声合計: {total_speech_sec:.1f}秒")
+    print(f"[PROGRESS] Whisper推論開始...")
+    print(f"[PROGRESS] ========================================")
+    _inference_start = _time.time()
 
     # プロンプトからprompt_idsを生成
     prompt_ids = None
@@ -565,7 +589,10 @@ def transcribe_long_audio(
     transcriptions = []  # type: ignore
 
     for i, (start_ms, end_ms) in enumerate(chunks):  # type: ignore
-        print(f"チャンク {i+1}/{len(chunks)} 処理中 ({start_ms/1000:.1f}s - {end_ms/1000:.1f}s)")  # type: ignore
+        pct = (i + 1) / len(chunks) * 100
+        if i % 10 == 0 or i == len(chunks) - 1:  # 10チャンク毎 + 最後
+            elapsed = _time.time() - _inference_start
+            print(f"[PROGRESS] チャンク {i+1}/{len(chunks)} ({pct:.0f}%) - 経過: {elapsed:.1f}秒")  # type: ignore
 
         # チャンクを抽出
         chunk_segment = audio_segment[start_ms:end_ms]  # type: ignore
@@ -611,7 +638,15 @@ def transcribe_long_audio(
 
         if transcription.strip():  # type: ignore  # 空でない場合のみ追加
             transcriptions.append(transcription.strip())  # type: ignore
-            print(f"結果: {transcription.strip()}")  # type: ignore
+
+    # 推論完了サマリー
+    _inference_time = _time.time() - _inference_start
+    _total_time = _time.time() - _preprocess_start
+    print(f"[PROGRESS] ========================================")
+    print(f"[PROGRESS] Whisper推論完了: {_inference_time:.1f}秒")
+    print(f"[PROGRESS] 総処理時間: {_total_time:.1f}秒 (前処理: {_preprocess_time:.1f}秒 + 推論: {_inference_time:.1f}秒)")
+    print(f"[PROGRESS] 入力音声: {audio_duration_sec:.1f}秒 → 処理速度: {audio_duration_sec/_total_time:.1f}x リアルタイム")
+    print(f"[PROGRESS] ========================================")
 
     # 全てのチャンクの結果を連結（改行区切り）
     full_transcription = "\n".join(transcriptions)  # type: ignore
@@ -672,30 +707,32 @@ if __name__ == "__main__":
         sys.exit(1)
 
 """
-会議音声向け前処理パイプラインの実装根拠：
+高速前処理パイプライン v2（Silero VAD 版）
 
-1. RMS正規化（音量差保持）：
-   - L2正規化の代わりにRMS正規化を使用
-   - 発話者間の相対的な音量差を保持しつつ、全体レベルを統一
-   - 会議音声の特性（マイク距離、声の大きさの違い）に対応
+=== 変更履歴 ===
+v2.0 (2025-12): Silero VAD 導入による抜本的高速化
+  - noisereduce 削除（Whisper自体のノイズ耐性に依存）
+  - pydub detect_nonsilent → Silero VAD（〜100倍高速）
+  - 500ms窓ループ削除（ベクトル演算に置換）
 
-2. 適応的無音検出閾値：
-   - 音量差20dB以上で会議音声モードを自動判別
-   - 小さな音声保護のため、最小音量から15%上を閾値に設定
-   - 短い無音（300ms）も検出して発話の切れ目を正確に把握
+=== 設計思想 ===
+1. Silero VAD による音声区間検出（音量非依存）
+   - ニューラルネットワークで「人の声らしさ」を検出
+   - 音量差に関係なく、大きな声の間の小さな声も検出
+   - threshold=0.3 で高感度設定（デフォルト0.5より敏感）
 
-3. 動的音量調整：
-   - セグメント毎の音量分析で小さな発話を検出
-   - -35dB以下の小さな音声に軽微な圧縮を適用
-   - 全体調整は控えめ（最大4dB）で音声の自然さを保持
+2. RMS正規化（高速ベクトル演算）
+   - 全体を-20dBFS相当に正規化
+   - クリッピング防止
 
-4. 会議音声の特徴に対応：
-   - 500ms窓での細かい音量分析
-   - 発話者交代、マイク距離変化、声量差への対応
-   - 小さな相槌や質問も確実に認識
+3. セグメント毎の音量保護
+   - 検出した音声区間のRMSを計算
+   - -35dB以下の小さな音声に軽微なダイナミックレンジ圧縮
+
+4. 冒頭・末尾の取りこぼし対策
+   - 最初の検出区間前と最後の検出区間後を自動追加
 
 参考：
-- 会議音声処理: IEEE音響・音声・信号処理学会標準
-- 動的レンジ処理: AES（Audio Engineering Society）推奨事項
+- Silero VAD: https://github.com/snakers4/silero-vad
 - Whisper論文: https://arxiv.org/abs/2212.04356
 """
