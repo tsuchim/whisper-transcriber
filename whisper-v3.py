@@ -503,7 +503,7 @@ class AudioChunkPrefetcher:
         self._prefetch_futures: dict[int, Future] = {}
         
         if self.use_pyav:
-            self._mode = "PyAV (persistent container)"
+            self._mode = "PyAV (persistent container, no prefetch)"
         elif self.use_ffmpeg:
             self._mode = "ffmpeg (threaded prefetch)"
         else:
@@ -513,13 +513,12 @@ class AudioChunkPrefetcher:
         """コンテキストマネージャ: 開始"""
         if self.use_pyav:
             self._open_pyav_container()
-            # PyAV persistent container はシングルコンテナなのでシリアル実行に制限
-            # 複数スレッドがロック待ちでタイムアウトするのを防ぐ
-            effective_workers = 1
+            # PyAV persistent container はシングルコンテナなのでプリフェッチ無効
+            # マルチスレッドでのロック競合・タイムアウトを完全に回避
+            self._executor = None
         else:
-            effective_workers = self.prefetch_count
-        # スレッドプール開始（ffmpegでもlibrosaでもプリフェッチに使用）
-        self._executor = ThreadPoolExecutor(max_workers=effective_workers)
+            # ffmpeg/librosa モードはプリフェッチ有効
+            self._executor = ThreadPoolExecutor(max_workers=self.prefetch_count)
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -674,6 +673,7 @@ class AudioChunkPrefetcher:
     
     def start_prefetch(self, start_idx: int):
         """指定インデックスから prefetch_count 個先までプリフェッチを開始"""
+        # プリフェッチ無効（PyAV persistent mode）の場合はスキップ
         if not self._executor:
             return
         
@@ -686,6 +686,11 @@ class AudioChunkPrefetcher:
         チャンクを取得。プリフェッチ済みならそれを返し、なければ同期読み込み。
         次のチャンクのプリフェッチも開始する。
         """
+        # プリフェッチ無効（PyAV persistent mode）の場合は直接同期読み込み
+        if not self._executor:
+            _, data = self._load_chunk(chunk_idx)
+            return data
+        
         # 次のプリフェッチを開始
         self.start_prefetch(chunk_idx + 1)
         
