@@ -85,7 +85,10 @@ try:
     print("Silero VAD が利用可能です（高速音声検出）")
 except Exception as e:
     has_silero_vad = False
-    print(f"Silero VAD 読み込み失敗: {e}（pydubフォールバック）")
+    import traceback
+    print(f"Silero VAD 読み込み失敗: {e}")
+    print(traceback.format_exc())
+    print("pydubフォールバックを使用します")
     from pydub.silence import detect_nonsilent  # type: ignore
 
 _FLOAT_EPS = np.finfo(np.float32).eps
