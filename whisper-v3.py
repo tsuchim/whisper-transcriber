@@ -663,7 +663,8 @@ class AudioChunkPrefetcher:
             return (chunk_idx, chunk_data)
             
         except Exception as e:
-            _log(f"Chunk {chunk_idx} load error: {e}", "warning")
+            error_msg = str(e) if e else type(e).__name__
+            _log(f"Chunk {chunk_idx} load error [{type(e).__name__}]: {error_msg}", "warning")
             return (chunk_idx, None)
     
     def start_prefetch(self, start_idx: int):
@@ -687,10 +688,17 @@ class AudioChunkPrefetcher:
         if chunk_idx in self._prefetch_futures:
             future = self._prefetch_futures.pop(chunk_idx)
             try:
-                _, data = future.result(timeout=30)
+                result = future.result(timeout=30)
+                if result is None:
+                    _log(f"Prefetch returned None for chunk {chunk_idx}", "warning")
+                    # フォールバック: 同期読み込み
+                    _, data = self._load_chunk(chunk_idx)
+                    return data
+                _, data = result
                 return data
             except Exception as e:
-                _log(f"Prefetch result error for chunk {chunk_idx}: {e}", "warning")
+                error_msg = str(e) if e else type(e).__name__
+                _log(f"Prefetch result error for chunk {chunk_idx}: {error_msg}", "warning")
         
         # プリフェッチされていなければ同期読み込み
         _, data = self._load_chunk(chunk_idx)
