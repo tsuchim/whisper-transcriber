@@ -26,6 +26,9 @@ import signal
 import gc
 import io
 import argparse
+from concurrent.futures import ThreadPoolExecutor, Future
+from queue import Queue
+from threading import Lock
 
 # Windows cp932エンコーディングエラー回避: UTF-8で出力し、エンコード不可文字は置換
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -466,6 +469,239 @@ def load_audio_via_pyav(path: str, sr: int = 16000) -> np.ndarray:
         return audio
 
 
+class AudioChunkPrefetcher:
+    """
+    非同期プリフェッチによる高速チャンク読み込み。
+    GPU推論中に次のチャンクをバックグラウンドで読み込み、I/O待ちを隠蔽する。
+    """
+    
+    def __init__(self, audio_file: str, chunks: list, prefetch_count: int = 3):
+        """
+        Args:
+            audio_file: 音声/動画ファイルパス
+            chunks: (start_ms, end_ms) のリスト
+            prefetch_count: 先読みするチャンク数（デフォルト3）
+        """
+        self.audio_file = audio_file
+        self.chunks = chunks
+        self.prefetch_count = prefetch_count
+        
+        # ストリーミング方式を判定
+        ext = Path(audio_file).suffix.lower()
+        is_video_container = ext in {".mkv", ".mp4", ".webm", ".mov", ".m4v", ".flv", ".avi", ".wmv"}
+        self.use_pyav = is_video_container and has_pyav
+        self.use_ffmpeg = is_video_container and _ffmpeg_available() and not self.use_pyav
+        
+        # PyAV用: コンテナを1回だけ開いて保持
+        self._container = None
+        self._audio_stream = None
+        self._resampler = None
+        self._container_lock = Lock()
+        
+        # プリフェッチ用スレッドプール
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._prefetch_futures: dict[int, Future] = {}
+        
+        if self.use_pyav:
+            self._mode = "PyAV (persistent container)"
+        elif self.use_ffmpeg:
+            self._mode = "ffmpeg (threaded prefetch)"
+        else:
+            self._mode = "librosa"
+    
+    def __enter__(self):
+        """コンテキストマネージャ: 開始"""
+        if self.use_pyav:
+            self._open_pyav_container()
+        # スレッドプール開始（ffmpegでもlibrosaでもプリフェッチに使用）
+        self._executor = ThreadPoolExecutor(max_workers=self.prefetch_count)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """コンテキストマネージャ: 終了"""
+        if self._executor:
+            self._executor.shutdown(wait=False)
+            self._executor = None
+        if self._container:
+            try:
+                self._container.close()
+            except Exception:
+                pass
+            self._container = None
+        return False
+    
+    def _open_pyav_container(self):
+        """PyAVコンテナを開く（1回のみ）"""
+        if not has_pyav:
+            return
+        try:
+            self._container = av.open(self.audio_file)  # type: ignore
+            for s in self._container.streams:  # type: ignore
+                if s.type == "audio":  # type: ignore
+                    self._audio_stream = s
+                    break
+            if self._audio_stream:
+                self._resampler = av.audio.resampler.AudioResampler(  # type: ignore
+                    format="s16",
+                    layout="mono",
+                    rate=16000,
+                )
+        except Exception as e:
+            _log(f"PyAVコンテナ初期化失敗: {e}", "warning")
+            self._container = None
+            self.use_pyav = False
+            self.use_ffmpeg = _ffmpeg_available()
+    
+    def _load_chunk_pyav_persistent(self, start_sec: float, duration_sec: float) -> np.ndarray:
+        """
+        開いたままのPyAVコンテナからチャンクを読み込む（シーク＋デコード）。
+        スレッドセーフのためロックを使用。
+        """
+        if not self._container or not self._audio_stream:
+            return np.array([], dtype=np.float32)
+        
+        end_sec = start_sec + duration_sec
+        
+        with self._container_lock:
+            try:
+                # シーク
+                start_pts = int(start_sec / self._audio_stream.time_base)  # type: ignore
+                self._container.seek(start_pts, stream=self._audio_stream)  # type: ignore
+                
+                # 新しいresamplerを作成（シーク後に状態リセット）
+                resampler = av.audio.resampler.AudioResampler(  # type: ignore
+                    format="s16",
+                    layout="mono",
+                    rate=16000,
+                )
+                
+                pcm_chunks: list[np.ndarray] = []
+                samples_needed = int(duration_sec * 16000)
+                samples_collected = 0
+                
+                for packet in self._container.demux(self._audio_stream):  # type: ignore
+                    for frame in packet.decode():  # type: ignore
+                        frame_time = float(frame.pts * self._audio_stream.time_base) if frame.pts is not None else 0  # type: ignore
+                        
+                        if frame_time < start_sec - 0.1:
+                            continue
+                        if frame_time > end_sec + 0.1:
+                            break
+                        
+                        resampled = resampler.resample(frame)  # type: ignore
+                        if resampled is None:
+                            continue
+                        
+                        frames = resampled if isinstance(resampled, list) else [resampled]
+                        for f in frames:
+                            buf = f.to_ndarray()  # type: ignore
+                            if buf.ndim == 1:
+                                pcm = buf.astype(np.int16)
+                            else:
+                                pcm = buf.astype(np.int16).mean(axis=0).astype(np.int16)
+                            if pcm.size:
+                                pcm_chunks.append(pcm)
+                                samples_collected += pcm.size
+                        
+                        if samples_collected >= samples_needed:
+                            break
+                    
+                    if samples_collected >= samples_needed:
+                        break
+                
+                if not pcm_chunks:
+                    return np.array([], dtype=np.float32)
+                
+                pcm_all = np.concatenate(pcm_chunks)
+                if len(pcm_all) > samples_needed:
+                    pcm_all = pcm_all[:samples_needed]
+                return pcm_all.astype(np.float32) / 32767.0
+                
+            except Exception as e:
+                _log(f"PyAV persistent read error: {e}", "warning")
+                return np.array([], dtype=np.float32)
+    
+    def _load_chunk(self, chunk_idx: int) -> tuple[int, Optional[np.ndarray]]:
+        """
+        指定インデックスのチャンクを読み込む（ワーカースレッド用）。
+        
+        Returns:
+            (chunk_idx, audio_data or None)
+        """
+        if chunk_idx >= len(self.chunks):
+            return (chunk_idx, None)
+        
+        start_ms, end_ms = self.chunks[chunk_idx]
+        duration_ms = end_ms - start_ms
+        
+        if duration_ms < 200:
+            return (chunk_idx, None)  # 短すぎるチャンク
+        
+        start_sec = start_ms / 1000.0
+        duration_sec = duration_ms / 1000.0
+        
+        try:
+            if self.use_pyav and self._container:
+                chunk_data = self._load_chunk_pyav_persistent(start_sec, duration_sec)
+            elif self.use_ffmpeg:
+                chunk_data = load_audio_chunk_via_ffmpeg(self.audio_file, start_sec, duration_sec, sr=16000)
+            else:
+                chunk_data, _ = librosa.load(self.audio_file, sr=16000, offset=start_sec, duration=duration_sec)  # type: ignore
+            
+            if len(chunk_data) < 100:
+                return (chunk_idx, None)
+            
+            # 正規化もここで実行（CPUバウンドだがGPUを待たせないため）
+            chunk_data = np.nan_to_num(chunk_data, nan=0.0, posinf=1.0, neginf=-1.0)
+            rms = np.sqrt(np.mean(chunk_data**2))
+            if rms > 1e-6:
+                target_rms = 0.1
+                gain = min(target_rms / rms, 10.0)
+                chunk_data = chunk_data * gain
+                chunk_data = np.clip(chunk_data, -1.0, 1.0)
+            
+            return (chunk_idx, chunk_data)
+            
+        except Exception as e:
+            _log(f"Chunk {chunk_idx} load error: {e}", "warning")
+            return (chunk_idx, None)
+    
+    def start_prefetch(self, start_idx: int):
+        """指定インデックスから prefetch_count 個先までプリフェッチを開始"""
+        if not self._executor:
+            return
+        
+        for i in range(start_idx, min(start_idx + self.prefetch_count, len(self.chunks))):
+            if i not in self._prefetch_futures:
+                self._prefetch_futures[i] = self._executor.submit(self._load_chunk, i)
+    
+    def get_chunk(self, chunk_idx: int) -> Optional[np.ndarray]:
+        """
+        チャンクを取得。プリフェッチ済みならそれを返し、なければ同期読み込み。
+        次のチャンクのプリフェッチも開始する。
+        """
+        # 次のプリフェッチを開始
+        self.start_prefetch(chunk_idx + 1)
+        
+        # プリフェッチ結果を確認
+        if chunk_idx in self._prefetch_futures:
+            future = self._prefetch_futures.pop(chunk_idx)
+            try:
+                _, data = future.result(timeout=30)
+                return data
+            except Exception as e:
+                _log(f"Prefetch result error for chunk {chunk_idx}: {e}", "warning")
+        
+        # プリフェッチされていなければ同期読み込み
+        _, data = self._load_chunk(chunk_idx)
+        return data
+    
+    @property
+    def mode(self) -> str:
+        """使用中のストリーミングモード"""
+        return self._mode
+
+
 def _parse_args() -> argparse.Namespace:
     """
     コマンドライン引数を解析
@@ -724,105 +960,73 @@ def transcribe_long_audio(
     transcriptions = []  # type: ignore
     chunk_errors = 0  # エラーカウント
     
-    # ストリーミング読み込み方式の選択
-    ext = Path(audio_file).suffix.lower()
-    is_video_container = ext in {".mkv", ".mp4", ".webm", ".mov", ".m4v", ".flv", ".avi", ".wmv"}
-    use_pyav_streaming = is_video_container and has_pyav
-    use_ffmpeg_streaming = is_video_container and _ffmpeg_available() and not use_pyav_streaming
-    
-    if use_pyav_streaming:
-        _log("[PROGRESS] ストリーミングモード: PyAV")
-    elif use_ffmpeg_streaming:
-        _log("[PROGRESS] ストリーミングモード: ffmpeg")
-    else:
-        _log("[PROGRESS] ストリーミングモード: librosa (非推奨: 大ファイルでメモリ増大の可能性)", "warning")
+    # プリフェッチ付きストリーミング読み込み
+    with AudioChunkPrefetcher(audio_file, chunks, prefetch_count=3) as prefetcher:
+        _log(f"[PROGRESS] ストリーミングモード: {prefetcher.mode}")
+        
+        # 最初のプリフェッチを開始
+        prefetcher.start_prefetch(0)
+        
+        for i in range(len(chunks)):
+            pct = (i + 1) / len(chunks) * 100
+            # 20% 刻みで進捗表示（最後も表示）
+            prev_pct = i / len(chunks) * 100
+            if pct >= prev_pct + 20 or i == len(chunks) - 1:
+                elapsed = _time.time() - _inference_start
+                _log(f"[PROGRESS] チャンク {i+1}/{len(chunks)} ({pct:.0f}%) - {elapsed:.0f}/{audio_duration_sec:.0f}秒")
 
-    for i, (start_ms, end_ms) in enumerate(chunks):  # type: ignore
-        pct = (i + 1) / len(chunks) * 100
-        # 20% 刻みで進捗表示（最後も表示）
-        prev_pct = i / len(chunks) * 100
-        if pct >= prev_pct + 20 or i == len(chunks) - 1:
-            elapsed = _time.time() - _inference_start
-            _log(f"[PROGRESS] チャンク {i+1}/{len(chunks)} ({pct:.0f}%) - {elapsed:.0f}/{audio_duration_sec:.0f}秒")  # type: ignore
-
-        # 短すぎるチャンクは処理しない
-        duration_ms = end_ms - start_ms
-        if duration_ms < 200:
-            continue
-
-        try:
-            # === ストリーミング読み込み: チャンク単位でファイルから直接読み込み ===
-            start_sec = start_ms / 1000.0
-            duration_sec = duration_ms / 1000.0
-            
-            if use_pyav_streaming:
-                chunk_data = load_audio_chunk_via_pyav(audio_file, start_sec, duration_sec, sr=16000)
-            elif use_ffmpeg_streaming:
-                chunk_data = load_audio_chunk_via_ffmpeg(audio_file, start_sec, duration_sec, sr=16000)
-            else:
-                # フォールバック: librosa で部分読み込み（offsetとduration指定）
-                chunk_data, _ = librosa.load(audio_file, sr=16000, offset=start_sec, duration=duration_sec)  # type: ignore
-            
-            if len(chunk_data) < 100:  # サンプル数が少なすぎる
-                continue
-            
-            # === チャンク単位の正規化（小さい声も増幅） ===
-            chunk_data = np.nan_to_num(chunk_data, nan=0.0, posinf=1.0, neginf=-1.0)
-            rms = np.sqrt(np.mean(chunk_data**2))
-            if rms > 1e-6:  # 無音でなければ正規化
-                target_rms = 0.1  # 約-20dBFS
-                gain = target_rms / rms
-                # 過度な増幅を防止（最大20dB = 10倍）
-                gain = min(gain, 10.0)
-                chunk_data = chunk_data * gain
-                chunk_data = np.clip(chunk_data, -1.0, 1.0)
-
-            # 音声を処理
-            inputs = processor(chunk_data, sampling_rate=16000, return_tensors="pt")  # type: ignore
-            input_features = inputs.input_features.to(device).to(torch_dtype)  # type: ignore
-
-            with torch.no_grad():
-                # generate 引数を構築
-                generate_kwargs = {
-                    "language": "ja",
-                    "task": "transcribe",
-                    "do_sample": False,
-                    "temperature": 0.0,
-                    "no_repeat_ngram_size": 0,
-                    "use_cache": True,
-                    "suppress_tokens": None,  # 抑制トークンを無効化
-                    "num_beams": 1,  # ビームサーチを無効化して感度向上
-                    "repetition_penalty": 1.0,  # 繰り返しペナルティを無効化
-                }
+            try:
+                # プリフェッチ済みチャンクを取得（I/O待ち最小化）
+                chunk_data = prefetcher.get_chunk(i)
                 
-                # プロンプトがある場合は prompt_ids を追加
-                if prompt_ids is not None:
-                    generate_kwargs["prompt_ids"] = prompt_ids
-                
-                generated_tokens = model.generate(  # pyright: ignore
-                    input_features,
-                    **generate_kwargs
-                )
-                generated_tokens = cast(torch.Tensor, generated_tokens)  # pyright: ignore
+                if chunk_data is None or len(chunk_data) < 100:
+                    continue
 
-            transcription: str = processor.batch_decode(generated_tokens, skip_special_tokens=True)[0]  # type: ignore
+                # 音声を処理
+                inputs = processor(chunk_data, sampling_rate=16000, return_tensors="pt")  # type: ignore
+                input_features = inputs.input_features.to(device).to(torch_dtype)  # type: ignore
 
-            if transcription.strip():  # type: ignore  # 空でない場合のみ追加
-                transcriptions.append(transcription.strip())  # type: ignore
-                
-        except torch.cuda.OutOfMemoryError as e:
-            # CUDA OOM: 致命的なエラーとして報告（復旧不能の可能性）
-            _log(f"[ERROR] GPU メモリ不足 (チャンク {i+1}/{len(chunks)}): {e}", "error")
-            _log("[ERROR] GPU メモリを解放して再試行を推奨", "error")
-            chunk_errors += 1
-            # 必要に応じてここで raise して処理を中断することも可能
-            torch.cuda.empty_cache()  # 試しにキャッシュをクリア
-        except Exception as e:
-            # その他のエラー: ログして続行
-            _log(f"[ERROR] チャンク {i+1}/{len(chunks)} 処理エラー: {e}", "error")
-            chunk_errors += 1
-            if chunk_errors > len(chunks) * 0.1:  # 10%以上失敗したら中断
-                raise RuntimeError(f"エラー率が高すぎます ({chunk_errors}/{len(chunks)}チャンク失敗)") from e
+                with torch.no_grad():
+                    # generate 引数を構築
+                    generate_kwargs = {
+                        "language": "ja",
+                        "task": "transcribe",
+                        "do_sample": False,
+                        "temperature": 0.0,
+                        "no_repeat_ngram_size": 0,
+                        "use_cache": True,
+                        "suppress_tokens": None,  # 抑制トークンを無効化
+                        "num_beams": 1,  # ビームサーチを無効化して感度向上
+                        "repetition_penalty": 1.0,  # 繰り返しペナルティを無効化
+                    }
+                    
+                    # プロンプトがある場合は prompt_ids を追加
+                    if prompt_ids is not None:
+                        generate_kwargs["prompt_ids"] = prompt_ids
+                    
+                    generated_tokens = model.generate(  # pyright: ignore
+                        input_features,
+                        **generate_kwargs
+                    )
+                    generated_tokens = cast(torch.Tensor, generated_tokens)  # pyright: ignore
+
+                transcription: str = processor.batch_decode(generated_tokens, skip_special_tokens=True)[0]  # type: ignore
+
+                if transcription.strip():  # type: ignore  # 空でない場合のみ追加
+                    transcriptions.append(transcription.strip())  # type: ignore
+                    
+            except torch.cuda.OutOfMemoryError as e:
+                # CUDA OOM: 致命的なエラーとして報告（復旧不能の可能性）
+                _log(f"[ERROR] GPU メモリ不足 (チャンク {i+1}/{len(chunks)}): {e}", "error")
+                _log("[ERROR] GPU メモリを解放して再試行を推奨", "error")
+                chunk_errors += 1
+                torch.cuda.empty_cache()  # 試しにキャッシュをクリア
+            except Exception as e:
+                # その他のエラー: ログして続行
+                _log(f"[ERROR] チャンク {i+1}/{len(chunks)} 処理エラー: {e}", "error")
+                chunk_errors += 1
+                if chunk_errors > len(chunks) * 0.1:  # 10%以上失敗したら中断
+                    raise RuntimeError(f"エラー率が高すぎます ({chunk_errors}/{len(chunks)}チャンク失敗)") from e
 
     # 推論完了サマリー
     _inference_time = _time.time() - _inference_start
