@@ -19,6 +19,7 @@ limitations under the License.
 import sys
 import subprocess
 import shutil
+import logging
 from pathlib import Path
 from typing import cast, Optional
 import signal
@@ -29,6 +30,21 @@ import argparse
 # Windows cp932エンコーディングエラー回避: UTF-8で出力し、エンコード不可文字は置換
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+# ロガー設定: 呼び出し元から渡されたロガーを使用、なければ標準出力
+_logger: Optional[logging.Logger] = None
+
+def _log(msg: str, level: str = "info"):
+    """ログ出力（logger があればそちらに、なければ print）"""
+    if _logger:
+        getattr(_logger, level)(msg)
+    else:
+        print(msg)
+
+def set_logger(logger: logging.Logger):
+    """外部からロガーを設定"""
+    global _logger
+    _logger = logger
 
 import librosa
 import numpy as np
@@ -51,7 +67,6 @@ except ImportError:
     print("CuPy が見つかりません。CPUでnumpyを使用します")
 import torch
 from pydub import AudioSegment  # type: ignore
-from pydub.effects import compress_dynamic_range  # type: ignore
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
 # Silero VAD for fast voice activity detection
@@ -253,6 +268,133 @@ def load_audio_via_ffmpeg(path: str, sr: int = 16000) -> np.ndarray:
     return audio
 
 
+def load_audio_chunk_via_ffmpeg(path: str, start_sec: float, duration_sec: float, sr: int = 16000) -> np.ndarray:
+    """
+    ffmpegで指定した時間区間のみを音声として読み込む（ストリーミング方式）。
+    
+    Args:
+        path: 音声/動画ファイルパス
+        start_sec: 開始位置（秒）
+        duration_sec: 読み込む長さ（秒）
+        sr: サンプリングレート
+    
+    Returns:
+        指定区間の音声データ（float32, -1.0〜1.0）
+    """
+    cmd = [
+        "ffmpeg",
+        "-v", "error",
+        "-ss", str(start_sec),      # シーク位置（入力の前に指定で高速）
+        "-i", path,
+        "-t", str(duration_sec),    # 読み込む長さ
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ac", "1",
+        "-ar", str(sr),
+        "-f", "s16le",
+        "-",
+    ]
+    startupinfo = None
+    creationflags = 0
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        creationflags = subprocess.CREATE_NO_WINDOW
+
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, startupinfo=startupinfo, creationflags=creationflags)
+    pcm = np.frombuffer(proc.stdout, dtype=np.int16)
+    if pcm.size == 0:
+        return np.array([], dtype=np.float32)
+    audio = pcm.astype(np.float32) / 32767.0
+    return audio
+
+
+def load_audio_chunk_via_pyav(path: str, start_sec: float, duration_sec: float, sr: int = 16000) -> np.ndarray:
+    """
+    PyAVで指定した時間区間のみを音声として読み込む（ストリーミング方式）。
+    
+    Args:
+        path: 音声/動画ファイルパス
+        start_sec: 開始位置（秒）
+        duration_sec: 読み込む長さ（秒）
+        sr: サンプリングレート
+    
+    Returns:
+        指定区間の音声データ（float32, -1.0〜1.0）
+    """
+    if not has_pyav:
+        raise RuntimeError("PyAVがインストールされていません")
+    
+    end_sec = start_sec + duration_sec
+    
+    with av.open(path) as container:  # type: ignore
+        audio_stream = None
+        for s in container.streams:  # type: ignore
+            if s.type == "audio":  # type: ignore
+                audio_stream = s
+                break
+        if audio_stream is None:
+            raise ValueError("音声ストリームが見つかりませんでした")
+
+        # シーク（キーフレーム単位なので多少前から始まる可能性あり）
+        start_pts = int(start_sec / audio_stream.time_base)  # type: ignore
+        container.seek(start_pts, stream=audio_stream)  # type: ignore
+
+        resampler = av.audio.resampler.AudioResampler(  # type: ignore
+            format="s16",
+            layout="mono",
+            rate=sr,
+        )
+
+        pcm_chunks: list[np.ndarray] = []
+        samples_needed = int(duration_sec * sr)
+        samples_collected = 0
+        
+        for packet in container.demux(audio_stream):  # type: ignore
+            for frame in packet.decode():  # type: ignore
+                # フレームの時刻を取得
+                frame_time = float(frame.pts * audio_stream.time_base) if frame.pts is not None else 0  # type: ignore
+                
+                # 開始位置より前のフレームはスキップ
+                if frame_time < start_sec - 0.1:  # 100msのマージン
+                    continue
+                # 終了位置を超えたら終了
+                if frame_time > end_sec + 0.1:
+                    break
+                
+                resampled = resampler.resample(frame)  # type: ignore
+                if resampled is None:
+                    continue
+
+                frames = resampled if isinstance(resampled, list) else [resampled]
+                for f in frames:
+                    buf = f.to_ndarray()  # type: ignore
+                    if buf.ndim == 1:
+                        pcm = buf.astype(np.int16)
+                    else:
+                        pcm = buf.astype(np.int16).mean(axis=0).astype(np.int16)
+                    if pcm.size:
+                        pcm_chunks.append(pcm)
+                        samples_collected += pcm.size
+                
+                if samples_collected >= samples_needed:
+                    break
+            
+            if samples_collected >= samples_needed:
+                break
+
+        if not pcm_chunks:
+            return np.array([], dtype=np.float32)
+
+        pcm_all = np.concatenate(pcm_chunks)
+        # 必要なサンプル数に切り詰め
+        if len(pcm_all) > samples_needed:
+            pcm_all = pcm_all[:samples_needed]
+        audio = pcm_all.astype(np.float32) / 32767.0
+        return audio
+
+
 def load_audio_via_pyav(path: str, sr: int = 16000) -> np.ndarray:
     """
     PyAV(FFmpegバインディング)で動画から音声のみをデコードして16kHz/mono/PCMとして取得。
@@ -391,39 +533,53 @@ def transcribe_long_audio(
     
     Returns:
         文字起こし結果のテキスト
+        
+    Raises:
+        FileNotFoundError: 入力ファイルが存在しない場合
+        RuntimeError: 文字起こし処理中にエラーが発生した場合
     """
-    print(f"\n=== {audio_file} ===")
+    import time as _time
+    
+    # 入力ファイル存在確認
+    audio_path_obj = Path(audio_file)
+    if not audio_path_obj.exists():
+        raise FileNotFoundError(f"入力ファイルが存在しません: {audio_file}")
+    
+    _log(f"=== 文字起こし開始: {audio_path_obj.name} ===")
     
     if prompt:
-        print(f"プロンプト: {prompt}")
+        _log(f"プロンプト: {prompt}")
 
     # 音声を読み込み（mkvなど動画コンテナは"音声のみ"抽出）
-    ext = Path(audio_file).suffix.lower()
-    is_video_container = ext in {".mkv", ".mp4", ".webm", ".mov", ".m4v", ".flv", ".avi", ".wmv"}
-    if is_video_container and has_pyav:
-        print("PyAV経由で音声ストリームのみを読み込みます (in-process, 16kHz/mono)")
-        try:
-            audio = load_audio_via_pyav(audio_file, sr=16000)
-        except Exception as e:
-            print(f"PyAV読み込み失敗: {e}")
-            if _ffmpeg_available():
-                print("ffmpegサブプロセスにフォールバックします (-vn, 16kHz/mono)")
-                audio = load_audio_via_ffmpeg(audio_file, sr=16000)
-            else:
-                print("librosaにフォールバックします")
-                audio, _ = librosa.load(audio_file, sr=16000)  # type: ignore
-    elif is_video_container and _ffmpeg_available():
-        print("ffmpeg経由で音声ストリームのみを読み込みます (-vn, 16kHz/mono)")
-        audio = load_audio_via_ffmpeg(audio_file, sr=16000)
-    else:
-        # 非対応拡張子やffmpeg無しの場合はlibrosaにフォールバック
-        audio, _ = librosa.load(audio_file, sr=16000)  # type: ignore
+    try:
+        ext = Path(audio_file).suffix.lower()
+        is_video_container = ext in {".mkv", ".mp4", ".webm", ".mov", ".m4v", ".flv", ".avi", ".wmv"}
+        if is_video_container and has_pyav:
+            _log("PyAV経由で音声ストリームのみを読み込みます (in-process, 16kHz/mono)")
+            try:
+                audio = load_audio_via_pyav(audio_file, sr=16000)
+            except Exception as e:
+                _log(f"PyAV読み込み失敗: {e}", "warning")
+                if _ffmpeg_available():
+                    _log("ffmpegサブプロセスにフォールバックします (-vn, 16kHz/mono)")
+                    audio = load_audio_via_ffmpeg(audio_file, sr=16000)
+                else:
+                    _log("librosaにフォールバックします")
+                    audio, _ = librosa.load(audio_file, sr=16000)  # type: ignore
+        elif is_video_container and _ffmpeg_available():
+            _log("ffmpeg経由で音声ストリームのみを読み込みます (-vn, 16kHz/mono)")
+            audio = load_audio_via_ffmpeg(audio_file, sr=16000)
+        else:
+            # 非対応拡張子やffmpeg無しの場合はlibrosaにフォールバック
+            audio, _ = librosa.load(audio_file, sr=16000)  # type: ignore
+    except Exception as e:
+        _log(f"音声読み込みエラー: {e}", "error")
+        raise RuntimeError(f"音声読み込みに失敗しました: {audio_file}") from e
 
     # === 高速前処理パイプライン（Silero VAD + 軽量正規化） ===
-    import time as _time
     audio_duration_sec = len(audio) / 16000
-    print(f"[PROGRESS] 音声読み込み完了: {audio_duration_sec:.1f}秒 ({audio_duration_sec/60:.1f}分)")
-    print(f"[PROGRESS] 前処理開始... (GPU: {torch.cuda.is_available()}, デバイス: {device})")
+    _log(f"[PROGRESS] 音声読み込み完了: {audio_duration_sec:.1f}秒 ({audio_duration_sec/60:.1f}分)")
+    _log(f"[PROGRESS] 前処理開始... (GPU: {torch.cuda.is_available()}, デバイス: {device})")
     _preprocess_start = _time.time()
 
     # 1. NaN/Inf をクリーンアップ（必須）
@@ -447,9 +603,9 @@ def transcribe_long_audio(
         # GPU利用可能なら GPU に移動
         if torch.cuda.is_available():
             audio_tensor = audio_tensor.to(device)
-            print(f"[PROGRESS] Silero VAD 実行中 (GPU: {device})...")
+            _log(f"[PROGRESS] Silero VAD 実行中 (GPU: {device})...")
         else:
-            print("[PROGRESS] Silero VAD 実行中 (CPU)...")
+            _log("[PROGRESS] Silero VAD 実行中 (CPU)...")
         
         # 高感度設定: threshold を下げて小さな声も漏れなく検出
         speech_timestamps = _get_speech_timestamps(
@@ -470,10 +626,15 @@ def transcribe_long_audio(
             nonsilent_ranges.append((start_ms, end_ms))
         
         _vad_time = _time.time() - _vad_start
-        print(f"[PROGRESS] Silero VAD 完了: {len(nonsilent_ranges)} セグメント検出, {_vad_time:.2f}秒")
+        _log(f"[PROGRESS] Silero VAD 完了: {len(nonsilent_ranges)} セグメント検出, {_vad_time:.2f}秒")
+        
+        # GPU メモリ解放
+        del audio_tensor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     else:
         # フォールバック: pydub の detect_nonsilent（遅い）
-        print("[PROGRESS] 警告: Silero VAD 利用不可 → pydub (低速)")
+        _log("[PROGRESS] 警告: Silero VAD 利用不可 -> pydub (低速)", "warning")
         audio_int16 = (audio * 32767).astype(np.int16)
         audio_segment_fallback = AudioSegment(audio_int16.tobytes(), frame_rate=16000, sample_width=2, channels=1)
         nonsilent_ranges = detect_nonsilent(
@@ -482,40 +643,14 @@ def transcribe_long_audio(
             silence_thresh=-50,
             seek_step=25,
         )
-        print(f"pydub: {len(nonsilent_ranges)} 個の音声セグメントを検出")
+        del audio_segment_fallback, audio_int16
+        _log(f"pydub: {len(nonsilent_ranges)} 個の音声セグメントを検出")
 
-    # 4. pydubでの処理のためにAudioSegmentに変換
-    audio_int16_cpu = (audio * 32767).astype(np.int16)
-    audio_segment = AudioSegment(audio_int16_cpu.tobytes(), frame_rate=16000, sample_width=2, channels=1)
-    audio_length_ms = len(audio_segment)
-
-    # 5. セグメント毎の音量分析と小さな音声の増幅（高速ベクトル演算）
-    ffmpeg_ready = _ffmpeg_available()
-    
-    if nonsilent_ranges:
-        # 各セグメントのRMSを高速計算
-        segment_rms_list = []
-        for start_ms, end_ms in nonsilent_ranges:
-            start_sample = int(start_ms * 16)
-            end_sample = min(int(end_ms * 16), len(audio))
-            if end_sample > start_sample:
-                seg_audio = audio[start_sample:end_sample]
-                seg_rms = np.sqrt(np.mean(seg_audio**2))
-                if seg_rms > 0:
-                    seg_db = 20 * np.log10(seg_rms)
-                    segment_rms_list.append(seg_db)
-        
-        if segment_rms_list:
-            min_seg_db = min(segment_rms_list)
-            max_seg_db = max(segment_rms_list)
-            print(f"セグメント音量: 最小={min_seg_db:.1f}dB, 最大={max_seg_db:.1f}dB, 差={max_seg_db-min_seg_db:.1f}dB")
-            
-            # 小さな音声セグメントがある場合の保護処理
-            if min_seg_db < -35 and ffmpeg_ready:
-                audio_segment = compress_dynamic_range(
-                    audio_segment, threshold=-35.0, ratio=3.0, attack=5.0, release=50.0
-                )
-                print(f"小さな音声保護: 軽微な圧縮を適用（{min_seg_db:.1f}dB）")
+    # === メモリ解放: VAD完了後は音声データ不要 ===
+    audio_length_ms = int(audio_duration_sec * 1000)
+    del audio
+    gc.collect()
+    _log(f"[PROGRESS] VAD完了後メモリ解放 (ストリーミングモード)")
 
     # 6. 冒頭・末尾の取りこぼし対策 + 長時間セグメント分割
     max_chunk_ms = 25000  # 25秒（Whisperに適したサイズ）
@@ -524,7 +659,7 @@ def transcribe_long_audio(
     # 冒頭対策
     if nonsilent_ranges and nonsilent_ranges[0][0] > 500:
         processed_ranges.append((0, nonsilent_ranges[0][0]))
-        print(f"冒頭追加: 0-{nonsilent_ranges[0][0]}ms")
+        _log(f"冒頭追加: 0-{nonsilent_ranges[0][0]}ms")
 
     # 各セグメントを処理
     for start_ms, end_ms in nonsilent_ranges:
@@ -543,7 +678,7 @@ def transcribe_long_audio(
     # 末尾対策
     if nonsilent_ranges and nonsilent_ranges[-1][1] < audio_length_ms - 500:
         processed_ranges.append((nonsilent_ranges[-1][1], audio_length_ms))
-        print(f"末尾追加: {nonsilent_ranges[-1][1]}-{audio_length_ms}ms")
+        _log(f"末尾追加: {nonsilent_ranges[-1][1]}-{audio_length_ms}ms")
 
     # 7. チャンクにまとめる（隣接セグメントを結合）
     chunks = []
@@ -566,11 +701,11 @@ def transcribe_long_audio(
 
     _preprocess_time = _time.time() - _preprocess_start
     total_speech_sec = sum((e - s) / 1000 for s, e in chunks)
-    print(f"[PROGRESS] ========================================")
-    print(f"[PROGRESS] 前処理完了: {_preprocess_time:.2f}秒")
-    print(f"[PROGRESS] チャンク数: {len(chunks)}, 音声合計: {total_speech_sec:.1f}秒")
-    print(f"[PROGRESS] Whisper推論開始...")
-    print(f"[PROGRESS] ========================================")
+    _log(f"[PROGRESS] ========================================")
+    _log(f"[PROGRESS] 前処理完了: {_preprocess_time:.2f}秒")
+    _log(f"[PROGRESS] チャンク数: {len(chunks)}, 音声合計: {total_speech_sec:.1f}秒")
+    _log(f"[PROGRESS] Whisper推論開始...")
+    _log(f"[PROGRESS] ========================================")
     _inference_start = _time.time()
 
     # プロンプトからprompt_idsを生成
@@ -581,72 +716,124 @@ def transcribe_long_audio(
             # transformers 4.57+では prompt_ids は Rank-1 テンソル（1次元）が必要
             prompt_ids = processor.tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt")  # type: ignore
             prompt_ids = prompt_ids.squeeze(0).to(device)  # 2次元→1次元に変換してからGPUへ
-            print(f"prompt_ids shape: {prompt_ids.shape}")  # type: ignore
+            _log(f"prompt_ids shape: {prompt_ids.shape}")  # type: ignore
         except Exception as e:
-            print(f"プロンプトトークン化エラー（無視して続行）: {e}")
+            _log(f"プロンプトトークン化エラー(無視して続行): {e}", "warning")
             prompt_ids = None
 
     transcriptions = []  # type: ignore
+    chunk_errors = 0  # エラーカウント
+    
+    # ストリーミング読み込み方式の選択
+    ext = Path(audio_file).suffix.lower()
+    is_video_container = ext in {".mkv", ".mp4", ".webm", ".mov", ".m4v", ".flv", ".avi", ".wmv"}
+    use_pyav_streaming = is_video_container and has_pyav
+    use_ffmpeg_streaming = is_video_container and _ffmpeg_available() and not use_pyav_streaming
+    
+    if use_pyav_streaming:
+        _log("[PROGRESS] ストリーミングモード: PyAV")
+    elif use_ffmpeg_streaming:
+        _log("[PROGRESS] ストリーミングモード: ffmpeg")
+    else:
+        _log("[PROGRESS] ストリーミングモード: librosa (非推奨: 大ファイルでメモリ増大の可能性)", "warning")
 
     for i, (start_ms, end_ms) in enumerate(chunks):  # type: ignore
         pct = (i + 1) / len(chunks) * 100
-        if i % 10 == 0 or i == len(chunks) - 1:  # 10チャンク毎 + 最後
+        # 20% 刻みで進捗表示（最後も表示）
+        prev_pct = i / len(chunks) * 100
+        if pct >= prev_pct + 20 or i == len(chunks) - 1:
             elapsed = _time.time() - _inference_start
-            print(f"[PROGRESS] チャンク {i+1}/{len(chunks)} ({pct:.0f}%) - 経過: {elapsed:.1f}秒")  # type: ignore
+            _log(f"[PROGRESS] チャンク {i+1}/{len(chunks)} ({pct:.0f}%) - {elapsed:.0f}/{audio_duration_sec:.0f}秒")  # type: ignore
 
-        # チャンクを抽出
-        chunk_segment = audio_segment[start_ms:end_ms]  # type: ignore
-
-        # 短すぎるチャンクは処理しない（より短いチャンクも処理）
-        if len(chunk_segment) < 200:  # type: ignore
+        # 短すぎるチャンクは処理しない
+        duration_ms = end_ms - start_ms
+        if duration_ms < 200:
             continue
 
-        # numpy配列に変換（GPU対応）
-        # Extract samples as numpy array on CPU. Keeping this on host memory avoids
-        # repeated GPU->CPU round trips which were present with cp.asnumpy.
-        chunk_data = np.array(chunk_segment.get_array_of_samples(), dtype=np.float32) / 32767.0  # type: ignore
-
-        # 音声を処理
-        inputs = processor(chunk_data, sampling_rate=16000, return_tensors="pt")  # type: ignore
-        input_features = inputs.input_features.to(device).to(torch_dtype)  # type: ignore
-
-        with torch.no_grad():
-            # generate 引数を構築
-            generate_kwargs = {
-                "language": "ja",
-                "task": "transcribe",
-                "do_sample": False,
-                "temperature": 0.0,
-                "no_repeat_ngram_size": 0,
-                "use_cache": True,
-                "suppress_tokens": None,  # 抑制トークンを無効化
-                "num_beams": 1,  # ビームサーチを無効化して感度向上
-                "repetition_penalty": 1.0,  # 繰り返しペナルティを無効化
-            }
+        try:
+            # === ストリーミング読み込み: チャンク単位でファイルから直接読み込み ===
+            start_sec = start_ms / 1000.0
+            duration_sec = duration_ms / 1000.0
             
-            # プロンプトがある場合は prompt_ids を追加
-            if prompt_ids is not None:
-                generate_kwargs["prompt_ids"] = prompt_ids
+            if use_pyav_streaming:
+                chunk_data = load_audio_chunk_via_pyav(audio_file, start_sec, duration_sec, sr=16000)
+            elif use_ffmpeg_streaming:
+                chunk_data = load_audio_chunk_via_ffmpeg(audio_file, start_sec, duration_sec, sr=16000)
+            else:
+                # フォールバック: librosa で部分読み込み（offsetとduration指定）
+                chunk_data, _ = librosa.load(audio_file, sr=16000, offset=start_sec, duration=duration_sec)  # type: ignore
             
-            generated_tokens = model.generate(  # pyright: ignore
-                input_features,
-                **generate_kwargs
-            )
-            generated_tokens = cast(torch.Tensor, generated_tokens)  # pyright: ignore
+            if len(chunk_data) < 100:  # サンプル数が少なすぎる
+                continue
+            
+            # === チャンク単位の正規化（小さい声も増幅） ===
+            chunk_data = np.nan_to_num(chunk_data, nan=0.0, posinf=1.0, neginf=-1.0)
+            rms = np.sqrt(np.mean(chunk_data**2))
+            if rms > 1e-6:  # 無音でなければ正規化
+                target_rms = 0.1  # 約-20dBFS
+                gain = target_rms / rms
+                # 過度な増幅を防止（最大20dB = 10倍）
+                gain = min(gain, 10.0)
+                chunk_data = chunk_data * gain
+                chunk_data = np.clip(chunk_data, -1.0, 1.0)
 
-        transcription: str = processor.batch_decode(generated_tokens, skip_special_tokens=True)[0]  # type: ignore
+            # 音声を処理
+            inputs = processor(chunk_data, sampling_rate=16000, return_tensors="pt")  # type: ignore
+            input_features = inputs.input_features.to(device).to(torch_dtype)  # type: ignore
 
-        if transcription.strip():  # type: ignore  # 空でない場合のみ追加
-            transcriptions.append(transcription.strip())  # type: ignore
+            with torch.no_grad():
+                # generate 引数を構築
+                generate_kwargs = {
+                    "language": "ja",
+                    "task": "transcribe",
+                    "do_sample": False,
+                    "temperature": 0.0,
+                    "no_repeat_ngram_size": 0,
+                    "use_cache": True,
+                    "suppress_tokens": None,  # 抑制トークンを無効化
+                    "num_beams": 1,  # ビームサーチを無効化して感度向上
+                    "repetition_penalty": 1.0,  # 繰り返しペナルティを無効化
+                }
+                
+                # プロンプトがある場合は prompt_ids を追加
+                if prompt_ids is not None:
+                    generate_kwargs["prompt_ids"] = prompt_ids
+                
+                generated_tokens = model.generate(  # pyright: ignore
+                    input_features,
+                    **generate_kwargs
+                )
+                generated_tokens = cast(torch.Tensor, generated_tokens)  # pyright: ignore
+
+            transcription: str = processor.batch_decode(generated_tokens, skip_special_tokens=True)[0]  # type: ignore
+
+            if transcription.strip():  # type: ignore  # 空でない場合のみ追加
+                transcriptions.append(transcription.strip())  # type: ignore
+                
+        except torch.cuda.OutOfMemoryError as e:
+            # CUDA OOM: 致命的なエラーとして報告（復旧不能の可能性）
+            _log(f"[ERROR] GPU メモリ不足 (チャンク {i+1}/{len(chunks)}): {e}", "error")
+            _log("[ERROR] GPU メモリを解放して再試行を推奨", "error")
+            chunk_errors += 1
+            # 必要に応じてここで raise して処理を中断することも可能
+            torch.cuda.empty_cache()  # 試しにキャッシュをクリア
+        except Exception as e:
+            # その他のエラー: ログして続行
+            _log(f"[ERROR] チャンク {i+1}/{len(chunks)} 処理エラー: {e}", "error")
+            chunk_errors += 1
+            if chunk_errors > len(chunks) * 0.1:  # 10%以上失敗したら中断
+                raise RuntimeError(f"エラー率が高すぎます ({chunk_errors}/{len(chunks)}チャンク失敗)") from e
 
     # 推論完了サマリー
     _inference_time = _time.time() - _inference_start
     _total_time = _time.time() - _preprocess_start
-    print(f"[PROGRESS] ========================================")
-    print(f"[PROGRESS] Whisper推論完了: {_inference_time:.1f}秒")
-    print(f"[PROGRESS] 総処理時間: {_total_time:.1f}秒 (前処理: {_preprocess_time:.1f}秒 + 推論: {_inference_time:.1f}秒)")
-    print(f"[PROGRESS] 入力音声: {audio_duration_sec:.1f}秒 → 処理速度: {audio_duration_sec/_total_time:.1f}x リアルタイム")
-    print(f"[PROGRESS] ========================================")
+    _log(f"[PROGRESS] ========================================")
+    _log(f"[PROGRESS] Whisper推論完了: {_inference_time:.1f}秒")
+    if chunk_errors > 0:
+        _log(f"[PROGRESS] エラー発生チャンク: {chunk_errors}/{len(chunks)}", "warning")
+    _log(f"[PROGRESS] 総処理時間: {_total_time:.1f}秒 (前処理: {_preprocess_time:.1f}秒 + 推論: {_inference_time:.1f}秒)")
+    _log(f"[PROGRESS] 入力音声: {audio_duration_sec:.1f}秒 -> 処理速度: {audio_duration_sec/_total_time:.1f}x リアルタイム")
+    _log(f"[PROGRESS] ========================================")
 
     # 全てのチャンクの結果を連結（改行区切り）
     full_transcription = "\n".join(transcriptions)  # type: ignore
@@ -666,14 +853,12 @@ def transcribe_long_audio(
     try:
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(full_transcription)
-        print(f"\n=== テキストファイルに保存完了 ===")
-        print(f"出力先: {output_file}")
+        _log(f"=== テキストファイルに保存完了: {output_file} ===")
     except Exception as e:
-        print(f"ファイル保存エラー: {e}")
-        raise  # Re-raise to ensure non-zero exit code
+        _log(f"ファイル保存エラー: {e}", "error")
+        raise RuntimeError(f"出力ファイル保存に失敗: {output_file}") from e
 
-    print(f"\n=== 完全な転写結果 ===")  # type: ignore
-    print(full_transcription)  # type: ignore
+    _log(f"=== 文字起こし完了: {audio_path_obj.name} ({len(full_transcription)}文字) ===")
 
     return full_transcription  # type: ignore
 
