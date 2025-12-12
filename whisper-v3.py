@@ -119,7 +119,7 @@ def _silero_vad_in_chunks(
     chunk_count: int = 5,
     overlap_ms: int = 300,
 ) -> list[tuple[int, int]]:
-    """Silero VAD を分割実行し、20%刻みの進捗ログを可能にする。
+    """Silero VAD を分割実行し、進捗ログを出力する。
 
     注意:
       - 境界の取りこぼしを避けるため overlap を入れてからマージする。
@@ -142,7 +142,6 @@ def _silero_vad_in_chunks(
     chunk_len = int(np.ceil(total_samples / chunk_count))
 
     all_ranges: list[tuple[int, int]] = []
-    next_pct = 100 if is_single_chunk else 20
 
     for i in range(chunk_count):
         base_start = i * chunk_len
@@ -184,10 +183,11 @@ def _silero_vad_in_chunks(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # 素直に進捗を出す（チャンク完了数 / 総数）
         pct = int(round((i + 1) * 100 / chunk_count))
-        while pct >= next_pct and next_pct <= 100:
-            _log(f"[PROGRESS] VAD進捗: {next_pct}% ({i+1}/{chunk_count})")
-            next_pct += 20
+        if is_single_chunk:
+            pct = 100
+        _log(f"[PROGRESS] VAD進捗: {pct}% ({i+1}/{chunk_count})")
 
     return _merge_ranges_ms(all_ranges, gap_ms=150)
 
@@ -201,7 +201,7 @@ def _pydub_vad_in_chunks(
     silence_thresh: int = -50,
     seek_step: int = 25,
 ) -> list[tuple[int, int]]:
-    """pydub の detect_nonsilent を分割実行し、20%刻みの進捗ログを可能にする。"""
+    """pydub の detect_nonsilent を分割実行し、進捗ログを出力する。"""
     if "detect_nonsilent" not in globals():
         raise RuntimeError("pydub detect_nonsilent が利用できません")
 
@@ -218,7 +218,6 @@ def _pydub_vad_in_chunks(
     chunk_len = int(np.ceil(total_samples / chunk_count))
 
     all_ranges: list[tuple[int, int]] = []
-    next_pct = 100 if is_single_chunk else 20
 
     for i in range(chunk_count):
         base_start = i * chunk_len
@@ -254,10 +253,11 @@ def _pydub_vad_in_chunks(
 
         del audio_segment, audio_int16
 
+        # 素直に進捗を出す（チャンク完了数 / 総数）
         pct = int(round((i + 1) * 100 / chunk_count))
-        while pct >= next_pct and next_pct <= 100:
-            _log(f"[PROGRESS] VAD進捗: {next_pct}% ({i+1}/{chunk_count})")
-            next_pct += 20
+        if is_single_chunk:
+            pct = 100
+        _log(f"[PROGRESS] VAD進捗: {pct}% ({i+1}/{chunk_count})")
 
     return _merge_ranges_ms(all_ranges, gap_ms=150)
 
