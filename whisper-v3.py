@@ -119,7 +119,7 @@ def _silero_vad_in_chunks(
     chunk_count: int = 5,
     overlap_ms: int = 300,
 ) -> list[tuple[int, int]]:
-    """Silero VAD を5分割で実行し、20%刻みの進捗ログを可能にする。
+    """Silero VAD を分割実行し、20%刻みの進捗ログを可能にする。
 
     注意:
       - 境界の取りこぼしを避けるため overlap を入れてからマージする。
@@ -201,7 +201,7 @@ def _pydub_vad_in_chunks(
     silence_thresh: int = -50,
     seek_step: int = 25,
 ) -> list[tuple[int, int]]:
-    """pydub の detect_nonsilent を5分割で実行し、20%刻みの進捗ログを可能にする。"""
+    """pydub の detect_nonsilent を分割実行し、20%刻みの進捗ログを可能にする。"""
     if "detect_nonsilent" not in globals():
         raise RuntimeError("pydub detect_nonsilent が利用できません")
 
@@ -1126,8 +1126,10 @@ def transcribe_long_audio(
         else:
             _log("[PROGRESS] Silero VAD 実行中 (CPU)...")
 
-        # 20%刻みの進捗を出すため、全音声を5分割してVAD実行 → 範囲をマージ
-        nonsilent_ranges = _silero_vad_in_chunks(audio, sr=16000, chunk_count=5, overlap_ms=300)
+        # 20%刻みの進捗を出すため、全音声を「1時間ごと」に分割してVAD実行 → 範囲をマージ
+        # (固定個数ではなく floor(duration_sec/3600) を採用。ただし最低 1)
+        vad_chunk_count = max(1, int(audio_duration_sec // 3600))
+        nonsilent_ranges = _silero_vad_in_chunks(audio, sr=16000, chunk_count=vad_chunk_count, overlap_ms=300)
         
         _vad_time = _time.time() - _vad_start
         _log(f"[PROGRESS] Silero VAD 完了: {len(nonsilent_ranges)} セグメント検出, {_vad_time:.2f}秒")
@@ -1139,7 +1141,7 @@ def transcribe_long_audio(
         nonsilent_ranges = _pydub_vad_in_chunks(
             audio,
             sr=16000,
-            chunk_count=5,
+            chunk_count=max(1, int(audio_duration_sec // 3600)),
             overlap_ms=300,
             min_silence_len=400,
             silence_thresh=-50,
@@ -1240,8 +1242,9 @@ def transcribe_long_audio(
 
                 if pct >= next_threshold or is_last:
                     elapsed = _time.time() - _inference_start
+                    pct_display = 100 if is_last else int(pct)
                     _log(
-                        f"[PROGRESS] Whisper進捗: {pct:.1f}% (チャンク {i+1}/{len(chunks)}) - {elapsed:.0f}/{audio_duration_sec:.0f}秒"
+                        f"[PROGRESS] Whisper進捗: {pct_display}% (チャンク {i+1}/{len(chunks)}) - {elapsed:.0f}/{audio_duration_sec:.0f}秒"
                     )
 
                     if not is_last:
