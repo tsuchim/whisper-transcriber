@@ -1229,20 +1229,26 @@ def transcribe_long_audio(
         if len(chunks) == 0:
             _log("[PROGRESS] Whisper進捗: 100% (チャンク 0/0)")
         else:
-            next_pct = 20
+            next_threshold = 20
 
         for i in range(len(chunks)):
             if len(chunks) > 0:
-                pct_int = int(round((i + 1) * 100 / len(chunks)))
-                if i == len(chunks) - 1:
-                    pct_int = 100
+                pct = (i + 1) * 100.0 / len(chunks)
+                is_last = i == len(chunks) - 1
+                if is_last:
+                    pct = 100.0
 
-                while pct_int >= next_pct and next_pct <= 100:
+                if pct >= next_threshold or is_last:
                     elapsed = _time.time() - _inference_start
                     _log(
-                        f"[PROGRESS] Whisper進捗: {next_pct}% (チャンク {i+1}/{len(chunks)}) - {elapsed:.0f}/{audio_duration_sec:.0f}秒"
+                        f"[PROGRESS] Whisper進捗: {pct:.1f}% (チャンク {i+1}/{len(chunks)}) - {elapsed:.0f}/{audio_duration_sec:.0f}秒"
                     )
-                    next_pct += 20
+
+                    if not is_last:
+                        # 次の節目(20%刻み)を計算。1チャンクにつき最大1行にするため while は使わない。
+                        next_threshold = (int(pct // 20) + 1) * 20
+                        if next_threshold > 100:
+                            next_threshold = 100
 
             try:
                 # メモリからチャンクを取得（I/O ゼロ）
