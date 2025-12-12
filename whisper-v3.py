@@ -472,10 +472,98 @@ def load_audio_via_pyav(path: str, sr: int = 16000) -> np.ndarray:
         return audio
 
 
+class InMemoryChunkProvider:
+    """
+    メモリ上の PCM データからチャンクを切り出すプロバイダ。
+    
+    VAD で使用した PCM データをそのまま再利用し、Whisper 推論時の
+    ファイル I/O を完全に排除する。毎回ファイルをシークして読み込む
+    オーバーヘッドがなくなり、大幅な高速化を実現する。
+    
+    メモリ使用量:
+        - 16kHz mono float32 で 1時間 = 約 230MB
+        - 2時間の配信でも 460MB 程度
+        - Whisper モデル自体が数 GB 使用するため、相対的に小さい
+    """
+    
+    def __init__(self, audio_data: np.ndarray, chunks: list, sr: int = 16000):
+        """
+        Args:
+            audio_data: VAD で使用済みの PCM データ (float32, -1.0〜1.0)
+            chunks: (start_ms, end_ms) のリスト
+            sr: サンプリングレート（デフォルト 16000）
+        """
+        self.audio_data = audio_data
+        self.chunks = chunks
+        self.sr = sr
+        self._mode = "in-memory (zero I/O)"
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # audio_data の解放は呼び出し側に任せる
+        return False
+    
+    def get_chunk(self, chunk_idx: int) -> Optional[np.ndarray]:
+        """
+        指定インデックスのチャンクをメモリからスライスして返す。
+        
+        Returns:
+            チャンクの音声データ（float32）、または None
+        """
+        if chunk_idx >= len(self.chunks):
+            return None
+        
+        start_ms, end_ms = self.chunks[chunk_idx]
+        duration_ms = end_ms - start_ms
+        
+        if duration_ms < 200:
+            return None  # 短すぎるチャンク
+        
+        # ミリ秒 → サンプルインデックスに変換
+        start_sample = int(start_ms * self.sr / 1000)
+        end_sample = int(end_ms * self.sr / 1000)
+        
+        # 配列範囲チェック
+        if start_sample >= len(self.audio_data):
+            return None
+        end_sample = min(end_sample, len(self.audio_data))
+        
+        # スライス（コピーではなくビュー、ただし後で正規化するのでコピーが必要）
+        chunk_data = self.audio_data[start_sample:end_sample].copy()
+        
+        if len(chunk_data) < 100:
+            return None
+        
+        # 正規化（AudioChunkPrefetcher._load_chunk と同じ処理）
+        chunk_data = np.nan_to_num(chunk_data, nan=0.0, posinf=1.0, neginf=-1.0)
+        rms = np.sqrt(np.mean(chunk_data**2))
+        if rms > 1e-6:
+            target_rms = 0.1
+            gain = min(target_rms / rms, 10.0)
+            chunk_data = chunk_data * gain
+            chunk_data = np.clip(chunk_data, -1.0, 1.0)
+        
+        return chunk_data
+    
+    def start_prefetch(self, start_idx: int):
+        """互換性のためのダミーメソッド（メモリアクセスなのでプリフェッチ不要）"""
+        pass
+    
+    @property
+    def mode(self) -> str:
+        """使用中のモード"""
+        return self._mode
+
+
 class AudioChunkPrefetcher:
     """
     非同期プリフェッチによる高速チャンク読み込み。
     GPU推論中に次のチャンクをバックグラウンドで読み込み、I/O待ちを隠蔽する。
+    
+    注意: InMemoryChunkProvider が利用可能な場合はそちらを優先使用すること。
+    このクラスは audio_data がメモリに保持されていない場合のフォールバック用。
     """
     
     def __init__(self, audio_file: str, chunks: list, prefetch_count: int = 3):
@@ -906,11 +994,10 @@ def transcribe_long_audio(
         del audio_segment_fallback, audio_int16
         _log(f"pydub: {len(nonsilent_ranges)} 個の音声セグメントを検出")
 
-    # === メモリ解放: VAD完了後は音声データ不要 ===
+    # === VAD完了: audio はインメモリチャンクプロバイダで再利用 ===
     audio_length_ms = int(audio_duration_sec * 1000)
-    del audio
-    gc.collect()
-    _log(f"[PROGRESS] VAD完了後メモリ解放 (ストリーミングモード)")
+    # 注意: audio は削除しない（InMemoryChunkProvider で再利用）
+    _log(f"[PROGRESS] VAD完了 (PCMデータ保持: {len(audio) * 4 / 1024 / 1024:.1f}MB)")
 
     # 6. 冒頭・末尾の取りこぼし対策 + 長時間セグメント分割
     max_chunk_ms = 25000  # 25秒（Whisperに適したサイズ）
@@ -984,12 +1071,9 @@ def transcribe_long_audio(
     transcriptions = []  # type: ignore
     chunk_errors = 0  # エラーカウント
     
-    # プリフェッチ付きストリーミング読み込み
-    with AudioChunkPrefetcher(audio_file, chunks, prefetch_count=3) as prefetcher:
-        _log(f"[PROGRESS] ストリーミングモード: {prefetcher.mode}")
-        
-        # 最初のプリフェッチを開始
-        prefetcher.start_prefetch(0)
+    # インメモリチャンクプロバイダ: VAD で読み込んだ PCM を再利用（I/O ゼロ）
+    with InMemoryChunkProvider(audio, chunks) as chunk_provider:
+        _log(f"[PROGRESS] チャンク読み込みモード: {chunk_provider.mode}")
         
         for i in range(len(chunks)):
             pct = (i + 1) / len(chunks) * 100
@@ -1000,8 +1084,8 @@ def transcribe_long_audio(
                 _log(f"[PROGRESS] チャンク {i+1}/{len(chunks)} ({pct:.0f}%) - {elapsed:.0f}/{audio_duration_sec:.0f}秒")
 
             try:
-                # プリフェッチ済みチャンクを取得（I/O待ち最小化）
-                chunk_data = prefetcher.get_chunk(i)
+                # メモリからチャンクを取得（I/O ゼロ）
+                chunk_data = chunk_provider.get_chunk(i)
                 
                 if chunk_data is None or len(chunk_data) < 100:
                     continue
@@ -1051,6 +1135,11 @@ def transcribe_long_audio(
                 chunk_errors += 1
                 if chunk_errors > len(chunks) * 0.1:  # 10%以上失敗したら中断
                     raise RuntimeError(f"エラー率が高すぎます ({chunk_errors}/{len(chunks)}チャンク失敗)") from e
+
+    # === メモリ解放: 推論完了後に PCM データを解放 ===
+    del audio
+    gc.collect()
+    _log(f"[PROGRESS] PCMデータ解放完了")
 
     # 推論完了サマリー
     _inference_time = _time.time() - _inference_start
