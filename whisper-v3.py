@@ -17,6 +17,7 @@ limitations under the License.
 """
 
 import sys
+import os
 import subprocess
 import shutil
 import logging
@@ -92,6 +93,173 @@ except Exception as e:
     from pydub.silence import detect_nonsilent  # type: ignore
 
 _FLOAT_EPS = np.finfo(np.float32).eps
+
+
+def _merge_ranges_ms(ranges: list[tuple[int, int]], gap_ms: int = 100) -> list[tuple[int, int]]:
+    """(start_ms, end_ms) の範囲リストをソートしてマージする。"""
+    if not ranges:
+        return []
+
+    ranges_sorted = sorted(ranges, key=lambda x: (x[0], x[1]))
+    merged: list[tuple[int, int]] = []
+    cur_s, cur_e = ranges_sorted[0]
+    for s, e in ranges_sorted[1:]:
+        if s <= cur_e + gap_ms:
+            cur_e = max(cur_e, e)
+        else:
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    merged.append((cur_s, cur_e))
+    return merged
+
+
+def _silero_vad_in_chunks(
+    audio: np.ndarray,
+    sr: int,
+    chunk_count: int = 5,
+    overlap_ms: int = 300,
+) -> list[tuple[int, int]]:
+    """Silero VAD を5分割で実行し、20%刻みの進捗ログを可能にする。
+
+    注意:
+      - 境界の取りこぼしを避けるため overlap を入れてからマージする。
+      - 返り値は全体の (start_ms, end_ms) に正規化済み。
+    """
+    if not has_silero_vad:
+        raise RuntimeError("Silero VAD が利用できません")
+
+    total_samples = int(audio.shape[0])
+    if total_samples <= 0:
+        return []
+
+    # 短い音声は1チャンクで十分
+    if chunk_count <= 1 or total_samples < sr * 60:
+        chunk_count = 1
+
+    is_single_chunk = chunk_count == 1
+
+    overlap_samples = int(overlap_ms * sr / 1000)
+    chunk_len = int(np.ceil(total_samples / chunk_count))
+
+    all_ranges: list[tuple[int, int]] = []
+    next_pct = 100 if is_single_chunk else 20
+
+    for i in range(chunk_count):
+        base_start = i * chunk_len
+        base_end = min(total_samples, (i + 1) * chunk_len)
+        if base_start >= base_end:
+            break
+
+        # overlap 付きで切り出し
+        chunk_start = max(0, base_start - overlap_samples)
+        chunk_end = min(total_samples, base_end + overlap_samples)
+        chunk_audio = audio[chunk_start:chunk_end]
+
+        # VAD 実行
+        audio_tensor = torch.from_numpy(chunk_audio).float()
+        if torch.cuda.is_available():
+            audio_tensor = audio_tensor.to(device)
+
+        speech_timestamps = _get_speech_timestamps(
+            audio_tensor,
+            _vad_model,
+            threshold=0.3,
+            min_speech_duration_ms=100,
+            min_silence_duration_ms=150,
+            speech_pad_ms=100,
+            return_seconds=False,
+        )
+
+        # サンプル→ms、全体座標へ変換
+        for ts in speech_timestamps:
+            start_samp = int(ts["start"]) + chunk_start
+            end_samp = int(ts["end"]) + chunk_start
+            start_ms = int(start_samp * 1000 / sr)
+            end_ms = int(end_samp * 1000 / sr)
+            if end_ms > start_ms:
+                all_ranges.append((start_ms, end_ms))
+
+        # GPU メモリ解放
+        del audio_tensor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        pct = int(round((i + 1) * 100 / chunk_count))
+        while pct >= next_pct and next_pct <= 100:
+            _log(f"[PROGRESS] VAD進捗: {next_pct}% ({i+1}/{chunk_count})")
+            next_pct += 20
+
+    return _merge_ranges_ms(all_ranges, gap_ms=150)
+
+
+def _pydub_vad_in_chunks(
+    audio: np.ndarray,
+    sr: int,
+    chunk_count: int = 5,
+    overlap_ms: int = 300,
+    min_silence_len: int = 400,
+    silence_thresh: int = -50,
+    seek_step: int = 25,
+) -> list[tuple[int, int]]:
+    """pydub の detect_nonsilent を5分割で実行し、20%刻みの進捗ログを可能にする。"""
+    if "detect_nonsilent" not in globals():
+        raise RuntimeError("pydub detect_nonsilent が利用できません")
+
+    total_samples = int(audio.shape[0])
+    if total_samples <= 0:
+        return []
+
+    if chunk_count <= 1 or total_samples < sr * 60:
+        chunk_count = 1
+
+    is_single_chunk = chunk_count == 1
+
+    overlap_samples = int(overlap_ms * sr / 1000)
+    chunk_len = int(np.ceil(total_samples / chunk_count))
+
+    all_ranges: list[tuple[int, int]] = []
+    next_pct = 100 if is_single_chunk else 20
+
+    for i in range(chunk_count):
+        base_start = i * chunk_len
+        base_end = min(total_samples, (i + 1) * chunk_len)
+        if base_start >= base_end:
+            break
+
+        chunk_start = max(0, base_start - overlap_samples)
+        chunk_end = min(total_samples, base_end + overlap_samples)
+        chunk_audio = audio[chunk_start:chunk_end]
+
+        audio_int16 = (chunk_audio * 32767).astype(np.int16)
+        audio_segment = AudioSegment(
+            audio_int16.tobytes(),
+            frame_rate=sr,
+            sample_width=2,
+            channels=1,
+        )
+
+        # pydub は chunk 内の ms を返すので、全体 ms に変換
+        offset_ms = int(chunk_start * 1000 / sr)
+        local_ranges = detect_nonsilent(
+            audio_segment,
+            min_silence_len=min_silence_len,
+            silence_thresh=silence_thresh,
+            seek_step=seek_step,
+        )
+        for s_ms, e_ms in local_ranges:
+            start_ms = int(s_ms) + offset_ms
+            end_ms = int(e_ms) + offset_ms
+            if end_ms > start_ms:
+                all_ranges.append((start_ms, end_ms))
+
+        del audio_segment, audio_int16
+
+        pct = int(round((i + 1) * 100 / chunk_count))
+        while pct >= next_pct and next_pct <= 100:
+            _log(f"[PROGRESS] VAD進捗: {next_pct}% ({i+1}/{chunk_count})")
+            next_pct += 20
+
+    return _merge_ranges_ms(all_ranges, gap_ms=150)
 
 model_id = "kotoba-tech/kotoba-whisper-v2.2"
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
@@ -266,7 +434,11 @@ def load_audio_via_ffmpeg(path: str, sr: int = 16000) -> np.ndarray:
         startupinfo.wShowWindow = subprocess.SW_HIDE
         creationflags = subprocess.CREATE_NO_WINDOW
 
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, startupinfo=startupinfo, creationflags=creationflags)
+    # Windows環境での日本語パス対策: 環境変数をUTF-8に強制
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, startupinfo=startupinfo, creationflags=creationflags, env=env)
     pcm = np.frombuffer(proc.stdout, dtype=np.int16)
     if pcm.size == 0:
         raise ValueError("ffmpegで音声データを取得できませんでした")
@@ -308,7 +480,11 @@ def load_audio_chunk_via_ffmpeg(path: str, start_sec: float, duration_sec: float
         startupinfo.wShowWindow = subprocess.SW_HIDE
         creationflags = subprocess.CREATE_NO_WINDOW
 
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, startupinfo=startupinfo, creationflags=creationflags)
+    # Windows環境での日本語パス対策: 環境変数をUTF-8に強制
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, startupinfo=startupinfo, creationflags=creationflags, env=env)
     pcm = np.frombuffer(proc.stdout, dtype=np.int16)
     if pcm.size == 0:
         return np.array([], dtype=np.float32)
@@ -945,53 +1121,30 @@ def transcribe_long_audio(
     _vad_start = _time.time()
     
     if has_silero_vad:
-        # Silero VAD は torch.Tensor を期待
-        audio_tensor = torch.from_numpy(audio).float()
-        
-        # GPU利用可能なら GPU に移動
         if torch.cuda.is_available():
-            audio_tensor = audio_tensor.to(device)
             _log(f"[PROGRESS] Silero VAD 実行中 (GPU: {device})...")
         else:
             _log("[PROGRESS] Silero VAD 実行中 (CPU)...")
-        
-        # 高感度設定: threshold を下げて小さな声も漏れなく検出
-        speech_timestamps = _get_speech_timestamps(
-            audio_tensor,
-            _vad_model,
-            threshold=0.3,               # デフォルト0.5→0.3で感度UP
-            min_speech_duration_ms=100,  # 100ms以上の発話を検出
-            min_silence_duration_ms=150, # 150msの無音で分割（細かく）
-            speech_pad_ms=100,           # 発話前後に100msのマージン
-            return_seconds=False,        # サンプル単位で返す
-        )
-        
-        # サンプル単位 → ミリ秒単位に変換
-        nonsilent_ranges = []
-        for ts in speech_timestamps:
-            start_ms = int(ts['start'] / 16)  # 16kHz → ms
-            end_ms = int(ts['end'] / 16)
-            nonsilent_ranges.append((start_ms, end_ms))
+
+        # 20%刻みの進捗を出すため、全音声を5分割してVAD実行 → 範囲をマージ
+        nonsilent_ranges = _silero_vad_in_chunks(audio, sr=16000, chunk_count=5, overlap_ms=300)
         
         _vad_time = _time.time() - _vad_start
         _log(f"[PROGRESS] Silero VAD 完了: {len(nonsilent_ranges)} セグメント検出, {_vad_time:.2f}秒")
         
-        # GPU メモリ解放
-        del audio_tensor
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # GPU メモリ解放は _silero_vad_in_chunks 側で実施
     else:
         # フォールバック: pydub の detect_nonsilent（遅い）
         _log("[PROGRESS] 警告: Silero VAD 利用不可 -> pydub (低速)", "warning")
-        audio_int16 = (audio * 32767).astype(np.int16)
-        audio_segment_fallback = AudioSegment(audio_int16.tobytes(), frame_rate=16000, sample_width=2, channels=1)
-        nonsilent_ranges = detect_nonsilent(
-            audio_segment_fallback,
+        nonsilent_ranges = _pydub_vad_in_chunks(
+            audio,
+            sr=16000,
+            chunk_count=5,
+            overlap_ms=300,
             min_silence_len=400,
             silence_thresh=-50,
             seek_step=25,
         )
-        del audio_segment_fallback, audio_int16
         _log(f"pydub: {len(nonsilent_ranges)} 個の音声セグメントを検出")
 
     # === VAD完了: audio はインメモリチャンクプロバイダで再利用 ===
@@ -1048,11 +1201,9 @@ def transcribe_long_audio(
 
     _preprocess_time = _time.time() - _preprocess_start
     total_speech_sec = sum((e - s) / 1000 for s, e in chunks)
-    _log(f"[PROGRESS] ========================================")
-    _log(f"[PROGRESS] 前処理完了: {_preprocess_time:.2f}秒")
-    _log(f"[PROGRESS] チャンク数: {len(chunks)}, 音声合計: {total_speech_sec:.1f}秒")
-    _log(f"[PROGRESS] Whisper推論開始...")
-    _log(f"[PROGRESS] ========================================")
+    _log(
+        f"[PROGRESS] 前処理完了: {_preprocess_time:.2f}秒 / チャンク数: {len(chunks)} / 音声合計: {total_speech_sec:.1f}秒 / Whisper推論開始"
+    )
     _inference_start = _time.time()
 
     # プロンプトからprompt_idsを生成
@@ -1074,14 +1225,24 @@ def transcribe_long_audio(
     # インメモリチャンクプロバイダ: VAD で読み込んだ PCM を再利用（I/O ゼロ）
     with InMemoryChunkProvider(audio, chunks) as chunk_provider:
         _log(f"[PROGRESS] チャンク読み込みモード: {chunk_provider.mode}")
-        
+
+        if len(chunks) == 0:
+            _log("[PROGRESS] Whisper進捗: 100% (チャンク 0/0)")
+        else:
+            next_pct = 20
+
         for i in range(len(chunks)):
-            pct = (i + 1) / len(chunks) * 100
-            # 20% 刻みで進捗表示（最後も表示）
-            prev_pct = i / len(chunks) * 100
-            if pct >= prev_pct + 20 or i == len(chunks) - 1:
-                elapsed = _time.time() - _inference_start
-                _log(f"[PROGRESS] チャンク {i+1}/{len(chunks)} ({pct:.0f}%) - {elapsed:.0f}/{audio_duration_sec:.0f}秒")
+            if len(chunks) > 0:
+                pct_int = int(round((i + 1) * 100 / len(chunks)))
+                if i == len(chunks) - 1:
+                    pct_int = 100
+
+                while pct_int >= next_pct and next_pct <= 100:
+                    elapsed = _time.time() - _inference_start
+                    _log(
+                        f"[PROGRESS] Whisper進捗: {next_pct}% (チャンク {i+1}/{len(chunks)}) - {elapsed:.0f}/{audio_duration_sec:.0f}秒"
+                    )
+                    next_pct += 20
 
             try:
                 # メモリからチャンクを取得（I/O ゼロ）
@@ -1144,13 +1305,11 @@ def transcribe_long_audio(
     # 推論完了サマリー
     _inference_time = _time.time() - _inference_start
     _total_time = _time.time() - _preprocess_start
-    _log(f"[PROGRESS] ========================================")
-    _log(f"[PROGRESS] Whisper推論完了: {_inference_time:.1f}秒")
-    if chunk_errors > 0:
-        _log(f"[PROGRESS] エラー発生チャンク: {chunk_errors}/{len(chunks)}", "warning")
-    _log(f"[PROGRESS] 総処理時間: {_total_time:.1f}秒 (前処理: {_preprocess_time:.1f}秒 + 推論: {_inference_time:.1f}秒)")
-    _log(f"[PROGRESS] 入力音声: {audio_duration_sec:.1f}秒 -> 処理速度: {audio_duration_sec/_total_time:.1f}x リアルタイム")
-    _log(f"[PROGRESS] ========================================")
+    error_part = "" if chunk_errors <= 0 else f" / エラー発生チャンク: {chunk_errors}/{len(chunks)}"
+    _log(
+        f"[PROGRESS] Whisper推論完了: {_inference_time:.1f}秒{error_part} / 総処理時間: {_total_time:.1f}秒 (前処理: {_preprocess_time:.1f}秒 + 推論: {_inference_time:.1f}秒) / 入力音声: {audio_duration_sec:.1f}秒 -> 処理速度: {audio_duration_sec/_total_time:.1f}x リアルタイム",
+        "warning" if chunk_errors > 0 else "info",
+    )
 
     # 全てのチャンクの結果を連結（改行区切り）
     full_transcription = "\n".join(transcriptions)  # type: ignore
