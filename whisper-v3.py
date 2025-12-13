@@ -60,6 +60,24 @@ except ImportError:
     av = None  # type: ignore
     has_pyav = False
 
+def _av_open(path: str):
+    """Open media via PyAV with conservative probe settings.
+
+    Some containers (e.g. long FLV recordings) can intermittently fail stream
+    detection/initial decode with default probe/analyze sizes. Use larger
+    values to reduce false negatives.
+    """
+    # FFmpeg option values are strings.
+    # - probesize: bytes
+    # - analyzeduration: microseconds
+    return av.open(  # type: ignore
+        path,
+        options={
+            "probesize": "100M",
+            "analyzeduration": "100000000",
+        },
+    )
+
 try:
     import cupy as cp  # type: ignore
 
@@ -510,7 +528,7 @@ def load_audio_chunk_via_pyav(path: str, start_sec: float, duration_sec: float, 
     
     end_sec = start_sec + duration_sec
     
-    with av.open(path) as container:  # type: ignore
+    with _av_open(path) as container:  # type: ignore
         audio_stream = None
         for s in container.streams:  # type: ignore
             if s.type == "audio":  # type: ignore
@@ -523,9 +541,11 @@ def load_audio_chunk_via_pyav(path: str, start_sec: float, duration_sec: float, 
         start_pts = int(start_sec / audio_stream.time_base)  # type: ignore
         container.seek(start_pts, stream=audio_stream)  # type: ignore
 
+        # NOTE: Do not force output channel layout here. Some streams/container
+        # combinations can raise IndexError internally when layout is set.
+        # We downmix to mono ourselves from ndarray.
         resampler = av.audio.resampler.AudioResampler(  # type: ignore
             format="s16",
-            layout="mono",
             rate=sr,
         )
 
@@ -585,7 +605,7 @@ def load_audio_via_pyav(path: str, sr: int = 16000) -> np.ndarray:
     if not has_pyav:
         raise RuntimeError("PyAVがインストールされていません")
     # コンテナを開く
-    with av.open(path) as container:  # type: ignore
+    with _av_open(path) as container:  # type: ignore
         # 最初の音声ストリームを選択
         audio_stream = None
         for s in container.streams:  # type: ignore
@@ -596,9 +616,11 @@ def load_audio_via_pyav(path: str, sr: int = 16000) -> np.ndarray:
             raise ValueError("音声ストリームが見つかりませんでした")
 
         # 16kHz/mono/16bitPCMへリサンプル
+        # NOTE: Do not force output channel layout here. Some streams/container
+        # combinations can raise IndexError internally when layout is set.
+        # We downmix to mono ourselves from ndarray.
         resampler = av.audio.resampler.AudioResampler(  # type: ignore
             format="s16",
-            layout="mono",
             rate=sr,
         )
 
@@ -806,7 +828,7 @@ class AudioChunkPrefetcher:
         if not has_pyav:
             return
         try:
-            self._container = av.open(self.audio_file)  # type: ignore
+            self._container = _av_open(self.audio_file)  # type: ignore
             for s in self._container.streams:  # type: ignore
                 if s.type == "audio":  # type: ignore
                     self._audio_stream = s
@@ -814,7 +836,6 @@ class AudioChunkPrefetcher:
             if self._audio_stream:
                 self._resampler = av.audio.resampler.AudioResampler(  # type: ignore
                     format="s16",
-                    layout="mono",
                     rate=16000,
                 )
         except Exception as e:
@@ -842,7 +863,6 @@ class AudioChunkPrefetcher:
                 # 新しいresamplerを作成（シーク後に状態リセット）
                 resampler = av.audio.resampler.AudioResampler(  # type: ignore
                     format="s16",
-                    layout="mono",
                     rate=16000,
                 )
                 
@@ -1078,19 +1098,7 @@ def transcribe_long_audio(
     try:
         ext = Path(audio_file).suffix.lower()
         is_video_container = ext in {".mkv", ".mp4", ".webm", ".mov", ".m4v", ".flv", ".avi", ".wmv"}
-        if is_video_container and has_pyav:
-            _log("PyAV経由で音声ストリームのみを読み込みます (in-process, 16kHz/mono)")
-            try:
-                audio = load_audio_via_pyav(audio_file, sr=16000)
-            except Exception as e:
-                _log(f"PyAV読み込み失敗: {e}", "warning")
-                if _ffmpeg_available():
-                    _log("ffmpegサブプロセスにフォールバックします (-vn, 16kHz/mono)")
-                    audio = load_audio_via_ffmpeg(audio_file, sr=16000)
-                else:
-                    _log("librosaにフォールバックします")
-                    audio, _ = librosa.load(audio_file, sr=16000)  # type: ignore
-        elif is_video_container and _ffmpeg_available():
+        if is_video_container and _ffmpeg_available():
             _log("ffmpeg経由で音声ストリームのみを読み込みます (-vn, 16kHz/mono)")
             audio = load_audio_via_ffmpeg(audio_file, sr=16000)
         else:
@@ -1155,51 +1163,68 @@ def transcribe_long_audio(
     _log(f"[PROGRESS] VAD完了 (PCMデータ保持: {len(audio) * 4 / 1024 / 1024:.1f}MB)")
 
     # 6. 冒頭・末尾の取りこぼし対策 + 長時間セグメント分割
-    max_chunk_ms = 25000  # 25秒（Whisperに適したサイズ）
-    processed_ranges = []
+    # --- 定数 ---
+    EDGE_PAD_MS = 500       # 冒頭・末尾のパディング（切れ目保護）
+    LONG_SEG_THRESHOLD_MS = 20000  # これを超えるセグメントは分割
+    SPLIT_CHUNK_MS = 15000  # 分割時のチャンク長
+    SPLIT_STEP_MS = 12000   # 分割時のステップ（= SPLIT_CHUNK_MS - overlap 3s）
+    MIN_CHUNK_MS = 500      # 最小チャンク長
+    JOIN_GAP_MS = 300       # この範囲内のギャップは結合を許可
+    MAX_CHUNK_MS = 25000    # Whisper に渡す最大チャンク長
 
-    # 冒頭対策
-    if nonsilent_ranges and nonsilent_ranges[0][0] > 500:
-        processed_ranges.append((0, nonsilent_ranges[0][0]))
-        _log(f"冒頭追加: 0-{nonsilent_ranges[0][0]}ms")
+    # 冒頭・末尾の取りこぼし対策:
+    # 長い無音区間を渡さず、最初/最後の音声区間を最大 EDGE_PAD_MS だけパディング。
+    if nonsilent_ranges:
+        ranges_list = list(nonsilent_ranges)
+        # 単一要素でも両端パディングが正しく効くよう一括処理
+        first_s, first_e = ranges_list[0]
+        last_s, last_e = ranges_list[-1]
+        ranges_list[0] = (max(0, first_s - EDGE_PAD_MS), first_e)
+        if len(ranges_list) == 1:
+            # 単一要素: 両端を同時にパディング
+            ranges_list[0] = (ranges_list[0][0], min(audio_length_ms, first_e + EDGE_PAD_MS))
+        else:
+            ranges_list[-1] = (last_s, min(audio_length_ms, last_e + EDGE_PAD_MS))
+        nonsilent_ranges = ranges_list
 
-    # 各セグメントを処理
+    # 各セグメントを処理: 長時間セグメントは分割
+    processed_ranges: list[tuple[int, int]] = []
     for start_ms, end_ms in nonsilent_ranges:
         duration = end_ms - start_ms
-        if duration > 20000:
-            # 長時間セグメントは15秒ずつに分割（3秒オーバーラップ）
-            current = start_ms
-            while current < end_ms:
-                seg_end = min(current + 15000, end_ms)
-                if seg_end - current >= 500:
-                    processed_ranges.append((current, seg_end))
-                current += 12000
+        if duration > LONG_SEG_THRESHOLD_MS:
+            # 長時間セグメントは SPLIT_CHUNK_MS ずつに分割（オーバーラップ付き）
+            pos = start_ms
+            while pos < end_ms:
+                seg_end = min(pos + SPLIT_CHUNK_MS, end_ms)
+                if seg_end - pos >= MIN_CHUNK_MS:
+                    processed_ranges.append((pos, seg_end))
+                pos += SPLIT_STEP_MS
         else:
             processed_ranges.append((start_ms, end_ms))
 
-    # 末尾対策
-    if nonsilent_ranges and nonsilent_ranges[-1][1] < audio_length_ms - 500:
-        processed_ranges.append((nonsilent_ranges[-1][1], audio_length_ms))
-        _log(f"末尾追加: {nonsilent_ranges[-1][1]}-{audio_length_ms}ms")
-
-    # 7. チャンクにまとめる（隣接セグメントを結合）
-    chunks = []
-    current_start = None
-    current_end = None
+    # 7. チャンクにまとめる（隣接セグメントを結合、無音を尊重）
+    # ギャップが JOIN_GAP_MS 以下、かつ結合後 MAX_CHUNK_MS 以下なら結合。
+    # オーバーラップ（gap <= 0）も結合対象。
+    chunks: list[tuple[int, int]] = []
+    cur_start: int = -1
+    cur_end: int = -1
 
     for start_ms, end_ms in processed_ranges:
-        if current_start is None:
-            current_start = start_ms
-            current_end = end_ms
-        elif (end_ms - current_start) <= max_chunk_ms:
-            current_end = end_ms
+        if cur_start < 0:
+            cur_start, cur_end = start_ms, end_ms
         else:
-            chunks.append((current_start, current_end))
-            current_start = start_ms
-            current_end = end_ms
+            gap = start_ms - cur_end
+            merged_end = max(cur_end, end_ms)
+            merged_span = merged_end - cur_start
 
-    if current_start is not None:
-        chunks.append((current_start, current_end))
+            if (gap <= JOIN_GAP_MS) and (merged_span <= MAX_CHUNK_MS):
+                cur_end = merged_end
+            else:
+                chunks.append((cur_start, cur_end))
+                cur_start, cur_end = start_ms, end_ms
+
+    if cur_start >= 0:
+        chunks.append((cur_start, cur_end))
 
     _preprocess_time = _time.time() - _preprocess_start
     total_speech_sec = sum((e - s) / 1000 for s, e in chunks)
