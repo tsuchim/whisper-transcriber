@@ -181,7 +181,7 @@ def _silero_vad_in_chunks(
             audio_tensor,
             _vad_model,
             threshold=0.3,
-            min_speech_duration_ms=100,
+            min_speech_duration_ms=300,
             min_silence_duration_ms=150,
             speech_pad_ms=100,
             return_seconds=False,
