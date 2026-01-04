@@ -66,6 +66,7 @@ python whisper-v3.py video.mp4 video2.flv  # 複数ファイル対応
 | `--prompt` | `-p` | AIに渡すプロンプト文字列（文脈情報、話者名など） |
 | `--header` | `-H` | 出力ファイルの冒頭に付加するヘッダー（`\n` で改行） |
 | `--output` | `-o` | 出力ファイルパス（単一ファイル処理時のみ有効） |
+| `--vad-profile` |  | VADの優先順位プロファイル（`auto`/`fast`/`accurate`） |
 
 ### 使用例
 
@@ -81,7 +82,20 @@ python whisper-v3.py audio.flv --header "配信: 山田太郎\n日時: 2025-01-0
 
 # 出力ファイルを指定
 python whisper-v3.py audio.flv --output /path/to/output.txt
+
+# VADを軽量優先（環境依存のため自動でフォールバックします）
+python whisper-v3.py audio.mp3 --vad-profile fast
 ```
+
+### `--vad-profile` の詳細
+
+VAD（音声区間検出）のバックエンドは、環境や依存関係に応じて自動でフォールバックします。
+
+- `auto`（既定）: 精度優先の既定順序（Silero → WebRTC VAD → pydub）
+- `fast`: 軽量・高速優先（WebRTC VAD → Silero → pydub）
+- `accurate`: 高精度優先（Silero → WebRTC VAD → pydub）
+
+※ `webrtcvad` を使うには `pip install webrtcvad` が必要です（`requirements.txt` に含まれます）。
 
 ## インストール手順
 
@@ -105,6 +119,12 @@ pip install -r requirements.txt
 ```
 
 **注意**: PyTorch GPU版は `requirements.txt` の `--extra-index-url` から自動インストール。詳細は [PyTorch公式](https://pytorch.org/get-started/locally/) を参照。
+
+## 開発
+
+```bash
+python -m unittest discover -s tests
+```
 
 ## 前処理パイプラインの詳細
 
