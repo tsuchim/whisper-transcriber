@@ -591,7 +591,6 @@ def init_models() -> None:
         _log("Whisper モデルロード完了")
 
         # VADは必要になったら init_vad() が呼ばれる（ここでは強制しない）
-        _CLEANED = False
 
 # === リソースクリーンアップ関連 ===
 _CLEANED = False
