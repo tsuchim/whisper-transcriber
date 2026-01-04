@@ -359,6 +359,14 @@ def init_vad() -> bool:
     global has_silero_vad, _vad_model, _vad_utils, _get_speech_timestamps, detect_nonsilent
 
     with _vad_init_lock:
+        # pydub は常に利用可能にしておく（フォールバック用）
+        if detect_nonsilent is None:
+            try:
+                from pydub.silence import detect_nonsilent as _detect_nonsilent  # type: ignore
+                detect_nonsilent = _detect_nonsilent
+            except Exception:
+                detect_nonsilent = None
+
         if has_silero_vad and _vad_model is not None and _get_speech_timestamps is not None:
             return True
 
@@ -370,6 +378,11 @@ def init_vad() -> bool:
                 verbose=False,
             )
             _get_speech_timestamps, _, _, _, _ = _vad_utils
+            
+            # デバイス移動
+            if torch.cuda.is_available():
+                _vad_model.to(device)
+                
             has_silero_vad = True
             _log("Silero VAD 初期化完了（高速音声検出）")
             return True
@@ -378,12 +391,6 @@ def init_vad() -> bool:
             _vad_model = None
             _vad_utils = None
             _get_speech_timestamps = None
-            try:
-                from pydub.silence import detect_nonsilent as _detect_nonsilent  # type: ignore
-
-                detect_nonsilent = _detect_nonsilent
-            except Exception:
-                detect_nonsilent = None
             _log(f"Silero VAD 初期化失敗: {e}（pydub フォールバック）", "warning")
             return False
 
