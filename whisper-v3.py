@@ -46,21 +46,34 @@ def _configure_stdio_for_windows() -> None:
 
 # ロガー設定: 呼び出し元から渡されたロガーを使用、なければ標準出力
 _logger: Optional[logging.Logger] = None
+_logger_lock = Lock()
+
+_models_init_lock = Lock()
+_vad_init_lock = Lock()
 
 def _log(msg: str, level: str = "info"):
     """ログ出力（logger があればそちらに、なければ print）"""
-    if _logger:
-        getattr(_logger, level)(msg)
-    else:
-        # import 先でのログスパムを避けるため、logger 未設定時の debug は抑制
-        if level == "debug":
-            return
-        print(msg)
+    with _logger_lock:
+        logger = _logger
+
+    if logger is not None:
+        method = getattr(logger, level, None)
+        if callable(method):
+            method(msg)
+        else:
+            logger.info(msg)
+        return
+
+    # import 先でのログスパムを避けるため、logger 未設定時の debug は抑制
+    if level == "debug":
+        return
+    print(msg)
 
 def set_logger(logger: logging.Logger):
     """外部からロガーを設定"""
     global _logger
-    _logger = logger
+    with _logger_lock:
+        _logger = logger
 
 import librosa
 import numpy as np
@@ -116,6 +129,25 @@ _get_speech_timestamps = None
 detect_nonsilent = None
 
 _FLOAT_EPS = np.finfo(np.float32).eps
+
+# === Tuning constants (audio splitting / prefetch) ===
+# VADで得られた区間の端に余白を足す (ms)
+EDGE_PAD_MS = 500
+# 長いセグメントは分割してWhisperへ渡す (ms)
+LONG_SEG_THRESHOLD_MS = 20000
+# 分割チャンク長 (ms)
+SPLIT_CHUNK_MS = 15000
+# 分割チャンクのスライド幅 (ms)
+SPLIT_STEP_MS = 12000
+# Whisperに渡す最小チャンク長 (ms)
+MIN_CHUNK_MS = 500
+# 小さな無音ギャップは結合する (ms)
+JOIN_GAP_MS = 300
+# Whisperに渡す最大チャンク長 (ms)
+MAX_CHUNK_MS = 25000
+
+# プリフェッチの結果待ちタイムアウト (秒)
+PREFETCH_RESULT_TIMEOUT_SEC = 30.0
 
 
 def _webrtcvad_ranges_ms(
@@ -326,33 +358,34 @@ def init_vad() -> bool:
     """Silero VAD を初期化（初回のみ、必要になった時だけ）。"""
     global has_silero_vad, _vad_model, _vad_utils, _get_speech_timestamps, detect_nonsilent
 
-    if has_silero_vad and _vad_model is not None and _get_speech_timestamps is not None:
-        return True
+    with _vad_init_lock:
+        if has_silero_vad and _vad_model is not None and _get_speech_timestamps is not None:
+            return True
 
-    try:
-        _vad_model, _vad_utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            trust_repo=True,
-            verbose=False,
-        )
-        _get_speech_timestamps, _, _, _, _ = _vad_utils
-        has_silero_vad = True
-        _log("Silero VAD 初期化完了（高速音声検出）")
-        return True
-    except Exception as e:
-        has_silero_vad = False
-        _vad_model = None
-        _vad_utils = None
-        _get_speech_timestamps = None
         try:
-            from pydub.silence import detect_nonsilent as _detect_nonsilent  # type: ignore
+            _vad_model, _vad_utils = torch.hub.load(
+                repo_or_dir="snakers4/silero-vad",
+                model="silero_vad",
+                trust_repo=True,
+                verbose=False,
+            )
+            _get_speech_timestamps, _, _, _, _ = _vad_utils
+            has_silero_vad = True
+            _log("Silero VAD 初期化完了（高速音声検出）")
+            return True
+        except Exception as e:
+            has_silero_vad = False
+            _vad_model = None
+            _vad_utils = None
+            _get_speech_timestamps = None
+            try:
+                from pydub.silence import detect_nonsilent as _detect_nonsilent  # type: ignore
 
-            detect_nonsilent = _detect_nonsilent
-        except Exception:
-            detect_nonsilent = None
-        _log(f"Silero VAD 初期化失敗: {e}（pydub フォールバック）", "warning")
-        return False
+                detect_nonsilent = _detect_nonsilent
+            except Exception:
+                detect_nonsilent = None
+            _log(f"Silero VAD 初期化失敗: {e}（pydub フォールバック）", "warning")
+            return False
 
 
 def _merge_ranges_ms(ranges: list[tuple[int, int]], gap_ms: int = 100) -> list[tuple[int, int]]:
@@ -535,29 +568,30 @@ processor = None
 def init_models() -> None:
     """Whisper（とVAD）を初期化（import時に重い処理をしないため遅延ロード）。"""
     global model, processor, _CLEANED
-    if model is not None and processor is not None:
-        return
+    with _models_init_lock:
+        if model is not None and processor is not None:
+            return
 
-    _log(f"GPU利用可能: {torch.cuda.is_available()}", "debug")
-    _log(f"transformers device: {device}", "debug")
-    if has_cupy and torch.cuda.is_available():
-        _log("CuPy GPU acceleration: 有効", "debug")
-    else:
-        _log("CuPy GPU acceleration: 無効 (CPU処理)", "debug")
+        _log(f"GPU利用可能: {torch.cuda.is_available()}", "debug")
+        _log(f"transformers device: {device}", "debug")
+        if has_cupy and torch.cuda.is_available():
+            _log("CuPy GPU acceleration: 有効", "debug")
+        else:
+            _log("CuPy GPU acceleration: 無効 (CPU処理)", "debug")
 
-    # Whisper モデル/プロセッサ初期化
-    _log("Whisper モデルをロード中...")
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(  # type: ignore
-        model_id,
-        dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    ).to(device)
-    processor = AutoProcessor.from_pretrained(model_id)  # type: ignore
-    _log("Whisper モデルロード完了")
+        # Whisper モデル/プロセッサ初期化
+        _log("Whisper モデルをロード中...")
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(  # type: ignore
+            model_id,
+            dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        ).to(device)
+        processor = AutoProcessor.from_pretrained(model_id)  # type: ignore
+        _log("Whisper モデルロード完了")
 
-    # VADは必要になったら init_vad() が呼ばれる（ここでは強制しない）
-    _CLEANED = False
+        # VADは必要になったら init_vad() が呼ばれる（ここでは強制しない）
+        _CLEANED = False
 
 # === リソースクリーンアップ関連 ===
 _CLEANED = False
@@ -575,17 +609,20 @@ def _cleanup_resources():
         if model is not None:
             del model
     except Exception:
+        # 終了時のクリーンアップで発生した例外は無視し、呼び出し元の例外伝播を優先する
         pass
     try:
         if processor is not None:
             del processor
     except Exception:
+        # 終了時のクリーンアップで発生した例外は無視し、呼び出し元の例外伝播を優先する
         pass
     # VAD モデル削除
     try:
         if _vad_model is not None:
             del _vad_model
     except Exception:
+        # 終了時のクリーンアップで発生した例外は無視し、呼び出し元の例外伝播を優先する
         pass
     _vad_model = None
     model = None
@@ -609,6 +646,7 @@ def _cleanup_resources():
         gc.collect()
         _log("[CLEANUP] gc.collect 実行")
     except Exception:
+        # gc.collect が失敗しても致命的ではないため無視する
         pass
     _CLEANED = True
     _log("[CLEANUP] 完了")
@@ -629,6 +667,7 @@ def offload_model():
             _log("[RESOURCE] Silero VAD をCPUに退避中...", "debug")
             _vad_model.to("cpu")
     except Exception:
+        # 一部環境で VAD モデルのデバイス移動に失敗する場合があるため無視する
         pass
         
     if torch.cuda.is_available():
@@ -650,6 +689,7 @@ def restore_model():
         if model is not None and next(model.parameters()).device.type == "cuda":
             return
     except Exception:
+        # 状態確認に失敗しても致命的ではないため継続する
         pass
 
     try:
@@ -664,6 +704,7 @@ def restore_model():
             _log("[RESOURCE] Silero VAD をGPUに復帰中...", "debug")
             _vad_model.to(device)
     except Exception:
+        # 一部環境で VAD モデルのデバイス移動に失敗する場合があるため無視する
         pass
     _log("[RESOURCE] GPU復帰完了", "debug")
 
@@ -683,10 +724,13 @@ def _register_signal_handlers() -> None:
     try:
         signal.signal(signal.SIGINT, _signal_handler)
     except Exception:
+        # 一部の環境（例: 制限付きランタイムやOS）ではシグナルハンドラの登録に失敗するため、
+        # その場合は処理継続を優先し、失敗を無視する。
         pass
     try:
         signal.signal(signal.SIGTERM, _signal_handler)  # type: ignore
     except Exception:
+        # 上記と同様に、シグナル登録に失敗しても致命的ではないため無視する。
         pass
 
 
@@ -724,12 +768,14 @@ def load_audio_via_ffmpeg(path: str, sr: int = 16000) -> np.ndarray:
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
         creationflags = subprocess.CREATE_NO_WINDOW
-
-    # Windows環境での日本語パス対策: 環境変数をUTF-8に強制
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, startupinfo=startupinfo, creationflags=creationflags, env=env)
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        startupinfo=startupinfo,
+        creationflags=creationflags,
+    )
     pcm = np.frombuffer(proc.stdout, dtype=np.int16)
     if pcm.size == 0:
         raise ValueError("ffmpegで音声データを取得できませんでした")
@@ -770,12 +816,14 @@ def load_audio_chunk_via_ffmpeg(path: str, start_sec: float, duration_sec: float
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
         creationflags = subprocess.CREATE_NO_WINDOW
-
-    # Windows環境での日本語パス対策: 環境変数をUTF-8に強制
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, startupinfo=startupinfo, creationflags=creationflags, env=env)
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        startupinfo=startupinfo,
+        creationflags=creationflags,
+    )
     pcm = np.frombuffer(proc.stdout, dtype=np.int16)
     if pcm.size == 0:
         return np.array([], dtype=np.float32)
@@ -842,7 +890,9 @@ def load_audio_chunk_via_pyav(path: str, start_sec: float, duration_sec: float, 
                 if resampled is None:
                     continue
 
-                frames = resampled if isinstance(resampled, list) else [resampled]
+                # PyAV's AudioResampler.resample may return either a single AudioFrame
+                # or a sequence (e.g., list/tuple) of AudioFrame objects, depending on buffering.
+                frames = resampled if isinstance(resampled, (list, tuple)) else [resampled]
                 for f in frames:
                     buf = f.to_ndarray()  # type: ignore
                     if buf.ndim == 1:
@@ -906,7 +956,8 @@ def load_audio_via_pyav(path: str, sr: int = 16000) -> np.ndarray:
                 if resampled is None:
                     continue
 
-                frames = resampled if isinstance(resampled, list) else [resampled]
+                # resampleの戻りは None / AudioFrame / [AudioFrame, ...] の場合があるため正規化する
+                frames = resampled if isinstance(resampled, (list, tuple)) else [resampled]
 
                 for f in frames:
                     # to_ndarray: shapeは(チャンネル, サンプル) もしくは (サンプル,)
@@ -923,7 +974,7 @@ def load_audio_via_pyav(path: str, sr: int = 16000) -> np.ndarray:
         try:
             flushed = resampler.resample(None)  # type: ignore
             if flushed is not None:
-                frames = flushed if isinstance(flushed, list) else [flushed]
+                frames = flushed if isinstance(flushed, (list, tuple)) else [flushed]
                 for f in frames:
                     buf = f.to_ndarray()  # type: ignore
                     if buf.ndim == 1:
@@ -933,6 +984,7 @@ def load_audio_via_pyav(path: str, sr: int = 16000) -> np.ndarray:
                     if pcm.size:
                         pcm_chunks.append(pcm)
         except Exception:
+            # 一部のPyAV環境ではflushが未対応/例外となる場合があるため無視する
             pass
 
         if not pcm_chunks:
@@ -1037,7 +1089,13 @@ class AudioChunkPrefetcher:
     このクラスは audio_data がメモリに保持されていない場合のフォールバック用。
     """
     
-    def __init__(self, audio_file: str, chunks: list, prefetch_count: int = 3):
+    def __init__(
+        self,
+        audio_file: str,
+        chunks: list,
+        prefetch_count: int = 3,
+        prefetch_timeout_sec: float = PREFETCH_RESULT_TIMEOUT_SEC,
+    ):
         """
         Args:
             audio_file: 音声/動画ファイルパス
@@ -1047,6 +1105,7 @@ class AudioChunkPrefetcher:
         self.audio_file = audio_file
         self.chunks = chunks
         self.prefetch_count = prefetch_count
+        self.prefetch_timeout_sec = float(prefetch_timeout_sec)
         
         # ストリーミング方式を判定
         ext = Path(audio_file).suffix.lower()
@@ -1086,12 +1145,21 @@ class AudioChunkPrefetcher:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """コンテキストマネージャ: 終了"""
         if self._executor:
-            self._executor.shutdown(wait=False)
+            # 終了時にできるだけプリフェッチを完了させるが、無限待機は避ける
+            try:
+                from concurrent.futures import wait as _wait
+
+                _wait(list(self._prefetch_futures.values()), timeout=2.0)
+            except Exception:
+                # cleanup時の例外は無視する（呼び出し元の例外を優先）
+                pass
+            self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
         if self._container:
             try:
                 self._container.close()
             except Exception:
+                # cleanup時の例外は無視する（呼び出し元の例外を優先）
                 pass
             self._container = None
         return False
@@ -1133,11 +1201,24 @@ class AudioChunkPrefetcher:
                 start_pts = int(start_sec / self._audio_stream.time_base)  # type: ignore
                 self._container.seek(start_pts, stream=self._audio_stream)  # type: ignore
                 
-                # 新しいresamplerを作成（シーク後に状態リセット）
-                resampler = av.audio.resampler.AudioResampler(  # type: ignore
-                    format="s16",
-                    rate=16000,
-                )
+                # resampler は基本再利用し、必要なら状態をリセットする
+                resampler = self._resampler
+                if resampler is None:
+                    resampler = av.audio.resampler.AudioResampler(  # type: ignore
+                        format="s16",
+                        rate=16000,
+                    )
+                    self._resampler = resampler
+                else:
+                    try:
+                        resampler.reset()  # type: ignore[attr-defined]
+                    except AttributeError:
+                        # reset() がない環境では安全のため再生成する
+                        resampler = av.audio.resampler.AudioResampler(  # type: ignore
+                            format="s16",
+                            rate=16000,
+                        )
+                        self._resampler = resampler
                 
                 pcm_chunks: list[np.ndarray] = []
                 samples_needed = int(duration_sec * 16000)
@@ -1156,7 +1237,7 @@ class AudioChunkPrefetcher:
                         if resampled is None:
                             continue
                         
-                        frames = resampled if isinstance(resampled, list) else [resampled]
+                        frames = resampled if isinstance(resampled, (list, tuple)) else [resampled]
                         for f in frames:
                             buf = f.to_ndarray()  # type: ignore
                             if buf.ndim == 1:
@@ -1227,7 +1308,7 @@ class AudioChunkPrefetcher:
             return (chunk_idx, chunk_data)
             
         except Exception as e:
-            error_msg = str(e) if e else type(e).__name__
+            error_msg = str(e) or repr(e) or type(e).__name__
             _log(f"Chunk {chunk_idx} load error [{type(e).__name__}]: {error_msg}", "warning")
             return (chunk_idx, None)
     
@@ -1258,7 +1339,7 @@ class AudioChunkPrefetcher:
         if chunk_idx in self._prefetch_futures:
             future = self._prefetch_futures.pop(chunk_idx)
             try:
-                result = future.result(timeout=30)
+                result = future.result(timeout=self.prefetch_timeout_sec)
                 # _load_chunk は (idx, data) を返す。data が None なら読み込み失敗
                 _, data = result
                 if data is not None:
@@ -1267,7 +1348,7 @@ class AudioChunkPrefetcher:
                 _log(f"Prefetch chunk {chunk_idx} returned None data", "warning")
                 return None
             except Exception as e:
-                error_msg = str(e) if str(e) else type(e).__name__
+                error_msg = str(e) or repr(e) or type(e).__name__
                 _log(f"Prefetch result error for chunk {chunk_idx} [{type(e).__name__}]: {error_msg}", "warning")
                 # 例外時はフォールバック同期読み込み
                 _, data = self._load_chunk(chunk_idx)
@@ -1455,14 +1536,6 @@ def transcribe_long_audio(
         nonsilent_ranges = [(0, audio_length_ms)]
 
     _log(f"[PROGRESS] VAD完了 (PCMデータ保持: {len(audio) * 4 / 1024 / 1024:.1f}MB)")
-
-    EDGE_PAD_MS = 500
-    LONG_SEG_THRESHOLD_MS = 20000
-    SPLIT_CHUNK_MS = 15000
-    SPLIT_STEP_MS = 12000
-    MIN_CHUNK_MS = 500
-    JOIN_GAP_MS = 300
-    MAX_CHUNK_MS = 25000
 
     if nonsilent_ranges:
         ranges_list = list(nonsilent_ranges)
