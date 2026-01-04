@@ -11,3 +11,4 @@ soundfile
 av
 # noisereduce は削除（Silero VAD に置換、Whisper自体のノイズ耐性に依存）
 # silero-vad は torch.hub.load で自動ダウンロードされるため requirements 不要
+webrtcvad

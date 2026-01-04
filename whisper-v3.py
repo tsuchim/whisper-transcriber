@@ -28,12 +28,21 @@ import gc
 import io
 import argparse
 from concurrent.futures import ThreadPoolExecutor, Future
-from queue import Queue
 from threading import Lock
 
-# Windows cp932エンコーディングエラー回避: UTF-8で出力し、エンコード不可文字は置換
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+def _configure_stdio_for_windows() -> None:
+    """Windows cp932 エンコーディングエラー回避（CLI実行時のみ）。"""
+    if sys.platform != "win32":
+        return
+    # 既に StringIO 等に差し替えられているケースもあるため buffer の存在を確認する
+    try:
+        if hasattr(sys.stdout, "buffer"):
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "buffer"):
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        # import 先（例: サービス/テスト）に副作用を持ち込まないため握りつぶす
+        pass
 
 # ロガー設定: 呼び出し元から渡されたロガーを使用、なければ標準出力
 _logger: Optional[logging.Logger] = None
@@ -43,6 +52,9 @@ def _log(msg: str, level: str = "info"):
     if _logger:
         getattr(_logger, level)(msg)
     else:
+        # import 先でのログスパムを避けるため、logger 未設定時の debug は抑制
+        if level == "debug":
+            return
         print(msg)
 
 def set_logger(logger: logging.Logger):
@@ -59,6 +71,14 @@ try:
 except ImportError:
     av = None  # type: ignore
     has_pyav = False
+
+try:
+    import webrtcvad  # type: ignore
+
+    has_webrtcvad = True
+except Exception:
+    webrtcvad = None  # type: ignore
+    has_webrtcvad = False
 
 def _av_open(path: str):
     """Open media via PyAV with conservative probe settings.
@@ -82,35 +102,257 @@ try:
     import cupy as cp  # type: ignore
 
     has_cupy = True  # type: ignore
-    print("CuPy (GPU対応numpy) が利用可能です")
 except ImportError:
     cp = np  # type: ignore
     has_cupy = False  # type: ignore
-    print("CuPy が見つかりません。CPUでnumpyを使用します")
 import torch
 from pydub import AudioSegment  # type: ignore
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
-# Silero VAD for fast voice activity detection
-try:
-    _vad_model, _vad_utils = torch.hub.load(
-        repo_or_dir='snakers4/silero-vad',
-        model='silero_vad',
-        trust_repo=True,
-        verbose=False
-    )
-    _get_speech_timestamps, _, _read_audio, _, _ = _vad_utils
-    has_silero_vad = True
-    print("Silero VAD が利用可能です（高速音声検出）")
-except Exception as e:
-    has_silero_vad = False
-    import traceback
-    print(f"Silero VAD 読み込み失敗: {e}")
-    print(traceback.format_exc())
-    print("pydubフォールバックを使用します")
-    from pydub.silence import detect_nonsilent  # type: ignore
+has_silero_vad = False
+_vad_model = None
+_vad_utils = None
+_get_speech_timestamps = None
+detect_nonsilent = None
 
 _FLOAT_EPS = np.finfo(np.float32).eps
+
+
+def _webrtcvad_ranges_ms(
+    audio: np.ndarray,
+    sr: int,
+    aggressiveness: int = 2,
+    frame_ms: int = 30,
+    padding_ms: int = 300,
+    start_ratio: float = 0.9,
+    end_ratio: float = 0.9,
+) -> list[tuple[int, int]]:
+    """WebRTC VAD で音声区間を検出（軽量・高速）。
+
+    Returns:
+        (start_ms, end_ms) のローカル範囲（chunk先頭=0）
+    """
+    if not has_webrtcvad or webrtcvad is None:
+        raise RuntimeError("webrtcvad が利用できません")
+
+    if sr not in {8000, 16000, 32000, 48000}:
+        raise ValueError(f"webrtcvad unsupported sample rate: {sr}")
+    if frame_ms not in {10, 20, 30}:
+        raise ValueError(f"webrtcvad unsupported frame_ms: {frame_ms}")
+
+    total_samples = int(audio.shape[0])
+    if total_samples <= 0:
+        return []
+
+    # float32 [-1,1] → int16 PCM
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+    bytes_per_frame = int(sr * frame_ms / 1000) * 2
+    if bytes_per_frame <= 0:
+        return []
+
+    pcm_bytes = pcm.tobytes()
+    n_frames = len(pcm_bytes) // bytes_per_frame
+    if n_frames <= 0:
+        return []
+
+    vad = webrtcvad.Vad(int(aggressiveness))  # type: ignore[union-attr]
+    padding_frames = max(1, int(round(padding_ms / frame_ms)))
+    start_trigger = int(np.ceil(padding_frames * start_ratio))
+    end_trigger = int(np.ceil(padding_frames * end_ratio))
+
+    ring: list[bool] = []
+    segments: list[tuple[int, int]] = []
+    in_segment = False
+    seg_start_frame = 0
+
+    for i in range(n_frames):
+        frame = pcm_bytes[i * bytes_per_frame : (i + 1) * bytes_per_frame]
+        is_speech = vad.is_speech(frame, sr)  # type: ignore[union-attr]
+
+        ring.append(bool(is_speech))
+        if len(ring) > padding_frames:
+            ring.pop(0)
+
+        if not in_segment:
+            if len(ring) == padding_frames and sum(ring) >= start_trigger:
+                in_segment = True
+                seg_start_frame = max(0, i - padding_frames + 1)
+                ring.clear()
+        else:
+            if len(ring) == padding_frames and (padding_frames - sum(ring)) >= end_trigger:
+                seg_end_frame = max(seg_start_frame, i - padding_frames + 1)
+                start_ms = int(seg_start_frame * frame_ms)
+                end_ms = int(seg_end_frame * frame_ms)
+                if end_ms > start_ms:
+                    segments.append((start_ms, end_ms))
+                in_segment = False
+                ring.clear()
+
+    if in_segment:
+        start_ms = int(seg_start_frame * frame_ms)
+        end_ms = int(n_frames * frame_ms)
+        if end_ms > start_ms:
+            segments.append((start_ms, end_ms))
+
+    return segments
+
+
+def _ranges_intersection_ms(a: list[tuple[int, int]], b: list[tuple[int, int]]) -> int:
+    """2つの (start_ms,end_ms) 範囲の交差長(ms)を計算する。"""
+    if not a or not b:
+        return 0
+    a_sorted = sorted(a)
+    b_sorted = sorted(b)
+    i = 0
+    j = 0
+    total = 0
+    while i < len(a_sorted) and j < len(b_sorted):
+        a_s, a_e = a_sorted[i]
+        b_s, b_e = b_sorted[j]
+        s = max(a_s, b_s)
+        e = min(a_e, b_e)
+        if e > s:
+            total += e - s
+        if a_e <= b_e:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
+def _ranges_total_ms(ranges: list[tuple[int, int]]) -> int:
+    """範囲の合計長(ms)を計算（重複があればマージしてから合計）。"""
+    merged = _merge_ranges_ms(ranges, gap_ms=0)
+    return sum(max(0, e - s) for s, e in merged)
+
+
+def _webrtcvad_calibrate_aggressiveness(audio: np.ndarray, sr: int, cap_sec: int = 3600) -> int:
+    """WebRTC VAD の aggressiveness を安定性ベースで自動選択する。
+
+    発話率などの「内容依存の閾値」に頼らず、aggressiveness=1..3 の結果の
+    一致度（交差/和集合）から最も安定している設定を選ぶ。
+    """
+    if not has_webrtcvad:
+        return 2
+    if audio.size <= 0:
+        return 2
+
+    max_samples = int(sr * max(1, cap_sec))
+    sample = audio[: min(int(audio.shape[0]), max_samples)]
+    if sample.size <= 0:
+        return 2
+
+    results: dict[int, list[tuple[int, int]]] = {}
+    for aggr in (1, 2, 3):
+        results[aggr] = _webrtcvad_ranges_ms(sample, sr=sr, aggressiveness=aggr, frame_ms=30, padding_ms=300)
+
+    scores: dict[int, float] = {}
+    for aggr in (1, 2, 3):
+        ratios: list[float] = []
+        for other in (1, 2, 3):
+            if other == aggr:
+                continue
+            inter = _ranges_intersection_ms(results[aggr], results[other])
+            union = _ranges_total_ms(results[aggr]) + _ranges_total_ms(results[other]) - inter
+            ratios.append(1.0 if union <= 0 else inter / union)
+        scores[aggr] = sum(ratios) / max(1, len(ratios))
+
+    best = max(scores.items(), key=lambda kv: kv[1])[0]
+    # タイは中庸(2)を優先
+    if scores.get(2, 0.0) == scores.get(best, 0.0):
+        return 2
+    return int(best)
+
+
+def _webrtcvad_in_chunks(
+    audio: np.ndarray,
+    sr: int,
+    chunk_count: int = 5,
+    overlap_ms: int = 300,
+    aggressiveness: Optional[int] = None,
+) -> list[tuple[int, int]]:
+    """WebRTC VAD を分割実行し、進捗ログを出力する。"""
+    if not has_webrtcvad:
+        raise RuntimeError("webrtcvad が利用できません")
+
+    chosen_aggr = aggressiveness if aggressiveness is not None else _webrtcvad_calibrate_aggressiveness(audio, sr=sr)
+    _log(f"WebRTC VAD aggressiveness(auto)={chosen_aggr}", "debug")
+
+    total_samples = int(audio.shape[0])
+    if total_samples <= 0:
+        return []
+
+    if chunk_count <= 1 or total_samples < sr * 60:
+        chunk_count = 1
+
+    is_single_chunk = chunk_count == 1
+    overlap_samples = int(overlap_ms * sr / 1000)
+    chunk_len = int(np.ceil(total_samples / chunk_count))
+
+    all_ranges: list[tuple[int, int]] = []
+    for i in range(chunk_count):
+        base_start = i * chunk_len
+        base_end = min(total_samples, (i + 1) * chunk_len)
+        if base_start >= base_end:
+            break
+
+        chunk_start = max(0, base_start - overlap_samples)
+        chunk_end = min(total_samples, base_end + overlap_samples)
+        chunk_audio = audio[chunk_start:chunk_end]
+
+        local = _webrtcvad_ranges_ms(
+            chunk_audio,
+            sr=sr,
+            aggressiveness=chosen_aggr,
+            frame_ms=30,
+            padding_ms=300,
+        )
+        offset_ms = int(chunk_start * 1000 / sr)
+        for s_ms, e_ms in local:
+            start_ms = int(s_ms) + offset_ms
+            end_ms = int(e_ms) + offset_ms
+            if end_ms > start_ms:
+                all_ranges.append((start_ms, end_ms))
+
+        pct = int(round((i + 1) * 100 / chunk_count))
+        if is_single_chunk:
+            pct = 100
+        _log(f"[PROGRESS] VAD進捗: {pct}% ({i+1}/{chunk_count})")
+
+    return _merge_ranges_ms(all_ranges, gap_ms=150)
+
+
+def init_vad() -> bool:
+    """Silero VAD を初期化（初回のみ、必要になった時だけ）。"""
+    global has_silero_vad, _vad_model, _vad_utils, _get_speech_timestamps, detect_nonsilent
+
+    if has_silero_vad and _vad_model is not None and _get_speech_timestamps is not None:
+        return True
+
+    try:
+        _vad_model, _vad_utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            trust_repo=True,
+            verbose=False,
+        )
+        _get_speech_timestamps, _, _, _, _ = _vad_utils
+        has_silero_vad = True
+        _log("Silero VAD 初期化完了（高速音声検出）")
+        return True
+    except Exception as e:
+        has_silero_vad = False
+        _vad_model = None
+        _vad_utils = None
+        _get_speech_timestamps = None
+        try:
+            from pydub.silence import detect_nonsilent as _detect_nonsilent  # type: ignore
+
+            detect_nonsilent = _detect_nonsilent
+        except Exception:
+            detect_nonsilent = None
+        _log(f"Silero VAD 初期化失敗: {e}（pydub フォールバック）", "warning")
+        return False
 
 
 def _merge_ranges_ms(ranges: list[tuple[int, int]], gap_ms: int = 100) -> list[tuple[int, int]]:
@@ -143,7 +385,7 @@ def _silero_vad_in_chunks(
       - 境界の取りこぼしを避けるため overlap を入れてからマージする。
       - 返り値は全体の (start_ms, end_ms) に正規化済み。
     """
-    if not has_silero_vad:
+    if not has_silero_vad or _vad_model is None or _get_speech_timestamps is None:
         raise RuntimeError("Silero VAD が利用できません")
 
     total_samples = int(audio.shape[0])
@@ -177,15 +419,17 @@ def _silero_vad_in_chunks(
         if torch.cuda.is_available():
             audio_tensor = audio_tensor.to(device)
 
-        speech_timestamps = _get_speech_timestamps(
-            audio_tensor,
-            _vad_model,
-            threshold=0.3,
-            min_speech_duration_ms=300,
-            min_silence_duration_ms=150,
-            speech_pad_ms=100,
-            return_seconds=False,
-        )
+        # 推論専用: inference_mode の方が no_grad より高速/省メモリ
+        with torch.inference_mode():
+            speech_timestamps = _get_speech_timestamps(  # type: ignore[misc]
+                audio_tensor,
+                _vad_model,
+                threshold=0.3,
+                min_speech_duration_ms=300,
+                min_silence_duration_ms=150,
+                speech_pad_ms=100,
+                return_seconds=False,
+            )
 
         # サンプル→ms、全体座標へ変換
         for ts in speech_timestamps:
@@ -197,6 +441,7 @@ def _silero_vad_in_chunks(
                 all_ranges.append((start_ms, end_ms))
 
         # GPU メモリ解放
+        del speech_timestamps
         del audio_tensor
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -220,7 +465,7 @@ def _pydub_vad_in_chunks(
     seek_step: int = 25,
 ) -> list[tuple[int, int]]:
     """pydub の detect_nonsilent を分割実行し、進捗ログを出力する。"""
-    if "detect_nonsilent" not in globals():
+    if detect_nonsilent is None:
         raise RuntimeError("pydub detect_nonsilent が利用できません")
 
     total_samples = int(audio.shape[0])
@@ -283,16 +528,36 @@ model_id = "kotoba-tech/kotoba-whisper-v2.2"
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# GPU利用可能なら Silero VAD モデルを GPU に移動
-if has_silero_vad and torch.cuda.is_available():
-    try:
-        _vad_model = _vad_model.to(device)
-        print("Silero VAD モデルを GPU に移動しました")
-    except Exception as e:
-        print(f"Silero VAD GPU移動失敗（CPU使用）: {e}")
+model = None
+processor = None
 
-model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id, dtype=torch_dtype, low_cpu_mem_usage=True, trust_remote_code=True).to(device)  # type: ignore
-processor = AutoProcessor.from_pretrained(model_id)  # type: ignore
+
+def init_models() -> None:
+    """Whisper（とVAD）を初期化（import時に重い処理をしないため遅延ロード）。"""
+    global model, processor, _CLEANED
+    if model is not None and processor is not None:
+        return
+
+    _log(f"GPU利用可能: {torch.cuda.is_available()}", "debug")
+    _log(f"transformers device: {device}", "debug")
+    if has_cupy and torch.cuda.is_available():
+        _log("CuPy GPU acceleration: 有効", "debug")
+    else:
+        _log("CuPy GPU acceleration: 無効 (CPU処理)", "debug")
+
+    # Whisper モデル/プロセッサ初期化
+    _log("Whisper モデルをロード中...")
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(  # type: ignore
+        model_id,
+        dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    ).to(device)
+    processor = AutoProcessor.from_pretrained(model_id)  # type: ignore
+    _log("Whisper モデルロード完了")
+
+    # VADは必要になったら init_vad() が呼ばれる（ここでは強制しない）
+    _CLEANED = False
 
 # === リソースクリーンアップ関連 ===
 _CLEANED = False
@@ -301,97 +566,111 @@ def _cleanup_resources():
     """GPU/メモリ/モデルリソースを確実に解放する。
     強制終了（SIGINT/SIGTERM）や通常終了の両方で呼ばれる。
     """
-    global model, processor, _CLEANED
+    global model, processor, _vad_model, _CLEANED
     if _CLEANED:
         return
-    print("[CLEANUP] 開始: リソース解放処理")
+    _log("[CLEANUP] 開始: リソース解放処理")
     # 推論モデル削除
     try:
-        del model
+        if model is not None:
+            del model
     except Exception:
         pass
     try:
-        del processor
+        if processor is not None:
+            del processor
     except Exception:
         pass
+    # VAD モデル削除
+    try:
+        if _vad_model is not None:
+            del _vad_model
+    except Exception:
+        pass
+    _vad_model = None
+    model = None
+    processor = None
     # CuPy メモリプール解放
     try:
-        if has_cupy and hasattr(cp, 'get_default_memory_pool'):
+        if has_cupy and hasattr(cp, "get_default_memory_pool"):
             cp.get_default_memory_pool().free_all_blocks()  # type: ignore
-            print("[CLEANUP] CuPy メモリプール解放")
+            _log("[CLEANUP] CuPy メモリプール解放")
     except Exception as e:
-        print(f"[CLEANUP] CuPy 解放失敗: {e}")
+        _log(f"[CLEANUP] CuPy 解放失敗: {e}", "warning")
     # Torch GPU キャッシュ解放
     try:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            print("[CLEANUP] torch.cuda.empty_cache 実行")
+            _log("[CLEANUP] torch.cuda.empty_cache 実行")
     except Exception as e:
-        print(f"[CLEANUP] torch キャッシュ解放失敗: {e}")
+        _log(f"[CLEANUP] torch キャッシュ解放失敗: {e}", "warning")
     # ガベージコレクション明示実行
     try:
         gc.collect()
-        print("[CLEANUP] gc.collect 実行")
+        _log("[CLEANUP] gc.collect 実行")
     except Exception:
         pass
     _CLEANED = True
-    print("[CLEANUP] 完了")
+    _log("[CLEANUP] 完了")
 
 
 def offload_model():
     """モデルをCPUに退避し、VRAMを解放する（他のアプリにGPUを譲るため）"""
     global model, _vad_model
-    print("[RESOURCE] モデルをCPUに退避中...")
     try:
-        if 'model' in globals() and model is not None:
+        if model is not None:
+            _log("[RESOURCE] Whisper モデルをCPUに退避中...", "debug")
             model.to("cpu")
     except Exception as e:
-        print(f"Whisperモデル退避失敗: {e}")
+        _log(f"Whisperモデル退避失敗: {e}", "warning")
 
     try:
-        if has_silero_vad and 'vad_model' in globals() and _vad_model is not None:
+        if _vad_model is not None:
+            _log("[RESOURCE] Silero VAD をCPUに退避中...", "debug")
             _vad_model.to("cpu")
-    except Exception as e:
-        # _vad_model might not be defined if init failed
+    except Exception:
         pass
         
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
-    print("[RESOURCE] VRAM解放完了 (CPU待機状態)")
+    _log("[RESOURCE] VRAM解放完了 (CPU待機状態)", "debug")
 
 
 def restore_model():
     """モデルをGPUに復帰させる（処理開始前）"""
     global model, _vad_model
+    if model is None or processor is None:
+        init_models()
     if not torch.cuda.is_available():
         return
 
     # 既にGPUにあるか確認（簡易チェック）
     try:
-        if 'model' in globals() and model is not None and next(model.parameters()).device.type == 'cuda':
+        if model is not None and next(model.parameters()).device.type == "cuda":
             return
     except Exception:
         pass
 
-    print("[RESOURCE] モデルをGPUに復帰中...")
     try:
-        if 'model' in globals() and model is not None:
+        if model is not None:
+            _log("[RESOURCE] Whisper モデルをGPUに復帰中...", "debug")
             model.to(device)
     except Exception as e:
-        print(f"Whisperモデル復帰失敗: {e}")
+        _log(f"Whisperモデル復帰失敗: {e}", "warning")
 
     try:
-        if has_silero_vad and 'vad_model' in globals() and _vad_model is not None:
+        if _vad_model is not None:
+            _log("[RESOURCE] Silero VAD をGPUに復帰中...", "debug")
             _vad_model.to(device)
-    except Exception as e:
+    except Exception:
         pass
-    print("[RESOURCE] GPU復帰完了")
+    _log("[RESOURCE] GPU復帰完了", "debug")
 
 
 def _signal_handler(signum, frame):
     """SIGINT/SIGTERM を捕捉して安全に終了"""
-    print(f"[CLEANUP] シグナル受信: {signum}. クリーンアップを実行して終了します")
+    _log(f"[CLEANUP] シグナル受信: {signum}. クリーンアップを実行して終了します", "warning")
     _cleanup_resources()
     # シグナルコードを反映した終了ステータス (POSIX 慣例)
     try:
@@ -399,22 +678,16 @@ def _signal_handler(signum, frame):
     except SystemExit:
         raise
 
-# Windows 環境では SIGTERM が無い場合があるので存在確認
-try:
-    signal.signal(signal.SIGINT, _signal_handler)
-except Exception:
-    pass
-try:
-    signal.signal(signal.SIGTERM, _signal_handler)  # type: ignore
-except Exception:
-    pass
-
-print(f"GPU利用可能: {torch.cuda.is_available()}")
-print(f"transformers device: {device}")
-if has_cupy and torch.cuda.is_available():
-    print(f"CuPy GPU acceleration: 有効")
-else:
-    print(f"CuPy GPU acceleration: 無効 (CPU処理)")
+def _register_signal_handlers() -> None:
+    # import 先へ副作用を持ち込まないため、CLI実行時にのみ呼ぶ
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+    except Exception:
+        pass
+    try:
+        signal.signal(signal.SIGTERM, _signal_handler)  # type: ignore
+    except Exception:
+        pass
 
 
 def _ffmpeg_available() -> bool:
@@ -1050,6 +1323,13 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help='出力ファイルパス（単一ファイル処理時のみ有効）'
     )
+    parser.add_argument(
+        "--vad-profile",
+        type=str,
+        default="auto",
+        choices=["auto", "fast", "accurate"],
+        help="VADのプロファイル: fast=軽量優先, accurate=検出性能優先, auto=既定",
+    )
     
     args = parser.parse_args()
     
@@ -1065,134 +1345,140 @@ def transcribe_long_audio(
     prompt: Optional[str] = None,
     header: Optional[str] = None,
     output_path: Optional[str] = None,
+    vad_profile: str = "auto",
 ) -> str:
-    """
-    長い音声を分割して処理し、結果を連結する
-    
-    Args:
-        audio_file: 音声/動画ファイルのパス
-        prompt: AIに渡すプロンプト文字列（任意）
-        header: 出力ファイルの冒頭に付加するヘッダ（任意）
-        output_path: 出力ファイルパス（Noneの場合は入力ファイルと同じ場所に .txt）
-    
-    Returns:
-        文字起こし結果のテキスト
-        
-    Raises:
-        FileNotFoundError: 入力ファイルが存在しない場合
-        RuntimeError: 文字起こし処理中にエラーが発生した場合
-    """
+    """長い音声を分割して文字起こしし、結果を連結して返す。"""
     import time as _time
-    
-    # 入力ファイル存在確認
+
+    if model is None or processor is None:
+        init_models()
+
     audio_path_obj = Path(audio_file)
     if not audio_path_obj.exists():
         raise FileNotFoundError(f"入力ファイルが存在しません: {audio_file}")
-    
+
     _log(f"=== 文字起こし開始: {audio_path_obj.name} ===")
-    
     if prompt:
         _log(f"プロンプト: {prompt}")
 
-    # 音声を読み込み（mkvなど動画コンテナは"音声のみ"抽出）
     try:
-        ext = Path(audio_file).suffix.lower()
+        ext = audio_path_obj.suffix.lower()
         is_video_container = ext in {".mkv", ".mp4", ".webm", ".mov", ".m4v", ".flv", ".avi", ".wmv"}
         if is_video_container and _ffmpeg_available():
             _log("ffmpeg経由で音声ストリームのみを読み込みます (-vn, 16kHz/mono)")
             audio = load_audio_via_ffmpeg(audio_file, sr=16000)
         else:
-            # 非対応拡張子やffmpeg無しの場合はlibrosaにフォールバック
             audio, _ = librosa.load(audio_file, sr=16000)  # type: ignore
     except Exception as e:
         _log(f"音声読み込みエラー: {e}", "error")
         raise RuntimeError(f"音声読み込みに失敗しました: {audio_file}") from e
 
-    # === 高速前処理パイプライン（Silero VAD + 軽量正規化） ===
     audio_duration_sec = len(audio) / 16000
     _log(f"[PROGRESS] 音声読み込み完了: {audio_duration_sec:.1f}秒 ({audio_duration_sec/60:.1f}分)")
     _log(f"[PROGRESS] 前処理開始... (GPU: {torch.cuda.is_available()}, デバイス: {device})")
     _preprocess_start = _time.time()
 
-    # 1. NaN/Inf をクリーンアップ（必須）
     audio = np.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0)
-
-    # 2. 高速RMS正規化（ベクトル演算）
     rms = np.sqrt(np.mean(audio**2))
     if rms > 0:
-        target_rms = 0.1  # 約-20dBFS
-        audio = audio * (target_rms / rms)
-        audio = np.clip(audio, -1.0, 1.0)
+        target_rms = 0.1
+        audio = np.clip(audio * (target_rms / rms), -1.0, 1.0)
     audio = cast(np.ndarray, audio)
 
-    # 3. Silero VAD で高速音声区間検出（音量非依存、小さな声も検出）
-    _vad_start = _time.time()
-    
-    if has_silero_vad:
-        if torch.cuda.is_available():
-            _log(f"[PROGRESS] Silero VAD 実行中 (GPU: {device})...")
-        else:
-            _log("[PROGRESS] Silero VAD 実行中 (CPU)...")
-
-        # 20%刻みの進捗を出すため、全音声を「1時間ごと」に分割してVAD実行 → 範囲をマージ
-        # (固定個数ではなく floor(duration_sec/3600) を採用。ただし最低 1)
-        vad_chunk_count = max(1, int(audio_duration_sec // 3600))
-        nonsilent_ranges = _silero_vad_in_chunks(audio, sr=16000, chunk_count=vad_chunk_count, overlap_ms=300)
-        
-        _vad_time = _time.time() - _vad_start
-        _log(f"[PROGRESS] Silero VAD 完了: {len(nonsilent_ranges)} セグメント検出, {_vad_time:.2f}秒")
-        
-        # GPU メモリ解放は _silero_vad_in_chunks 側で実施
-    else:
-        # フォールバック: pydub の detect_nonsilent（遅い）
-        _log("[PROGRESS] 警告: Silero VAD 利用不可 -> pydub (低速)", "warning")
-        nonsilent_ranges = _pydub_vad_in_chunks(
-            audio,
-            sr=16000,
-            chunk_count=max(1, int(audio_duration_sec // 3600)),
-            overlap_ms=300,
-            min_silence_len=400,
-            silence_thresh=-50,
-            seek_step=25,
-        )
-        _log(f"pydub: {len(nonsilent_ranges)} 個の音声セグメントを検出")
-
-    # === VAD完了: audio はインメモリチャンクプロバイダで再利用 ===
     audio_length_ms = int(audio_duration_sec * 1000)
-    # 注意: audio は削除しない（InMemoryChunkProvider で再利用）
+    _vad_start = _time.time()
+    vad_profile_norm = (vad_profile or "auto").strip().lower()
+    vad_chunk_count = max(1, int(audio_duration_sec // 3600))
+
+    def _run_vad_backend(name: str) -> Optional[list[tuple[int, int]]]:
+        try:
+            if name == "webrtcvad":
+                if not has_webrtcvad:
+                    raise RuntimeError("webrtcvad がインストールされていません")
+                ranges = _webrtcvad_in_chunks(
+                    audio,
+                    sr=16000,
+                    chunk_count=vad_chunk_count,
+                    overlap_ms=300,
+                    aggressiveness=None,
+                )
+                _log(f"[PROGRESS] WebRTC VAD 完了: {len(ranges)} セグメント検出, {_time.time() - _vad_start:.2f}秒")
+                return ranges
+
+            if name == "silero":
+                init_vad()
+                if not has_silero_vad:
+                    raise RuntimeError("Silero VAD が利用できません")
+                ranges = _silero_vad_in_chunks(audio, sr=16000, chunk_count=vad_chunk_count, overlap_ms=300)
+                _log(f"[PROGRESS] Silero VAD 完了: {len(ranges)} セグメント検出, {_time.time() - _vad_start:.2f}秒")
+                return ranges
+
+            if name == "pydub":
+                init_vad()
+                ranges = _pydub_vad_in_chunks(
+                    audio,
+                    sr=16000,
+                    chunk_count=vad_chunk_count,
+                    overlap_ms=300,
+                    min_silence_len=400,
+                    silence_thresh=-50,
+                    seek_step=25,
+                )
+                _log(f"[PROGRESS] pydub VAD 完了: {len(ranges)} セグメント検出, {_time.time() - _vad_start:.2f}秒")
+                return ranges
+
+            raise ValueError(f"unknown VAD backend: {name}")
+        except Exception as e:
+            # 「利用不可」「実行時エラー」どちらも同じくフォールバック対象
+            _log(f"[PROGRESS] VAD失敗: {name} -> フォールバック ({type(e).__name__}: {e})", "warning")
+            return None
+
+    # profile に応じて優先順位を決める（常に失敗時は warning を出して次へ）
+    if vad_profile_norm == "fast":
+        backends = ["webrtcvad", "silero", "pydub"]
+    elif vad_profile_norm == "accurate":
+        backends = ["silero", "webrtcvad", "pydub"]
+    else:
+        # auto: 既定は精度優先（従来互換）
+        backends = ["silero", "webrtcvad", "pydub"]
+
+    nonsilent_ranges: list[tuple[int, int]] = []
+    for b in backends:
+        got = _run_vad_backend(b)
+        if got is not None:
+            nonsilent_ranges = got
+            break
+
+    if not nonsilent_ranges and audio_length_ms > 0:
+        # VAD 全滅時でも処理は継続する（精度は落ちるが停止よりマシ）
+        _log("[PROGRESS] 警告: 利用可能なVADが無いため全区間をWhisperへ渡します", "warning")
+        nonsilent_ranges = [(0, audio_length_ms)]
+
     _log(f"[PROGRESS] VAD完了 (PCMデータ保持: {len(audio) * 4 / 1024 / 1024:.1f}MB)")
 
-    # 6. 冒頭・末尾の取りこぼし対策 + 長時間セグメント分割
-    # --- 定数 ---
-    EDGE_PAD_MS = 500       # 冒頭・末尾のパディング（切れ目保護）
-    LONG_SEG_THRESHOLD_MS = 20000  # これを超えるセグメントは分割
-    SPLIT_CHUNK_MS = 15000  # 分割時のチャンク長
-    SPLIT_STEP_MS = 12000   # 分割時のステップ（= SPLIT_CHUNK_MS - overlap 3s）
-    MIN_CHUNK_MS = 500      # 最小チャンク長
-    JOIN_GAP_MS = 300       # この範囲内のギャップは結合を許可
-    MAX_CHUNK_MS = 25000    # Whisper に渡す最大チャンク長
+    EDGE_PAD_MS = 500
+    LONG_SEG_THRESHOLD_MS = 20000
+    SPLIT_CHUNK_MS = 15000
+    SPLIT_STEP_MS = 12000
+    MIN_CHUNK_MS = 500
+    JOIN_GAP_MS = 300
+    MAX_CHUNK_MS = 25000
 
-    # 冒頭・末尾の取りこぼし対策:
-    # 長い無音区間を渡さず、最初/最後の音声区間を最大 EDGE_PAD_MS だけパディング。
     if nonsilent_ranges:
         ranges_list = list(nonsilent_ranges)
-        # 単一要素でも両端パディングが正しく効くよう一括処理
         first_s, first_e = ranges_list[0]
         last_s, last_e = ranges_list[-1]
         ranges_list[0] = (max(0, first_s - EDGE_PAD_MS), first_e)
         if len(ranges_list) == 1:
-            # 単一要素: 両端を同時にパディング
             ranges_list[0] = (ranges_list[0][0], min(audio_length_ms, first_e + EDGE_PAD_MS))
         else:
             ranges_list[-1] = (last_s, min(audio_length_ms, last_e + EDGE_PAD_MS))
         nonsilent_ranges = ranges_list
 
-    # 各セグメントを処理: 長時間セグメントは分割
     processed_ranges: list[tuple[int, int]] = []
     for start_ms, end_ms in nonsilent_ranges:
         duration = end_ms - start_ms
         if duration > LONG_SEG_THRESHOLD_MS:
-            # 長時間セグメントは SPLIT_CHUNK_MS ずつに分割（オーバーラップ付き）
             pos = start_ms
             while pos < end_ms:
                 seg_end = min(pos + SPLIT_CHUNK_MS, end_ms)
@@ -1202,95 +1488,67 @@ def transcribe_long_audio(
         else:
             processed_ranges.append((start_ms, end_ms))
 
-    # 7. チャンクにまとめる（隣接セグメントを結合、無音を尊重）
-    # ギャップが JOIN_GAP_MS 以下、かつ結合後 MAX_CHUNK_MS 以下なら結合。
-    # オーバーラップ（gap <= 0）も結合対象。
     chunks: list[tuple[int, int]] = []
-    cur_start: int = -1
-    cur_end: int = -1
-
+    cur_start = -1
+    cur_end = -1
     for start_ms, end_ms in processed_ranges:
         if cur_start < 0:
             cur_start, cur_end = start_ms, end_ms
+            continue
+
+        gap = start_ms - cur_end
+        merged_end = max(cur_end, end_ms)
+        merged_span = merged_end - cur_start
+        if (gap <= JOIN_GAP_MS) and (merged_span <= MAX_CHUNK_MS):
+            cur_end = merged_end
         else:
-            gap = start_ms - cur_end
-            merged_end = max(cur_end, end_ms)
-            merged_span = merged_end - cur_start
-
-            if (gap <= JOIN_GAP_MS) and (merged_span <= MAX_CHUNK_MS):
-                cur_end = merged_end
-            else:
-                chunks.append((cur_start, cur_end))
-                cur_start, cur_end = start_ms, end_ms
-
+            chunks.append((cur_start, cur_end))
+            cur_start, cur_end = start_ms, end_ms
     if cur_start >= 0:
         chunks.append((cur_start, cur_end))
 
     _preprocess_time = _time.time() - _preprocess_start
     total_speech_sec = sum((e - s) / 1000 for s, e in chunks)
-    _log(
-        f"[PROGRESS] 前処理完了: {_preprocess_time:.2f}秒 / チャンク数: {len(chunks)} / 音声合計: {total_speech_sec:.1f}秒 / Whisper推論開始"
-    )
+    _log(f"[PROGRESS] 前処理完了: {_preprocess_time:.2f}秒 / チャンク数: {len(chunks)} / 音声合計: {total_speech_sec:.1f}秒 / Whisper推論開始")
     _inference_start = _time.time()
 
-    # プロンプトからprompt_idsを生成
     prompt_ids = None
     if prompt:
         try:
-            # Whisper tokenizer でプロンプトをトークン化
-            # transformers 4.57+では prompt_ids は Rank-1 テンソル（1次元）が必要
-            prompt_ids = processor.tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt")  # type: ignore
-            prompt_ids = prompt_ids.squeeze(0).to(device)  # 2次元→1次元に変換してからGPUへ
-            _log(f"prompt_ids shape: {prompt_ids.shape}")  # type: ignore
+            prompt_ids = processor.tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt")  # type: ignore[union-attr]
+            prompt_ids = prompt_ids.squeeze(0).to(device)
+            _log(f"prompt_ids shape: {prompt_ids.shape}", "debug")  # type: ignore
         except Exception as e:
             _log(f"プロンプトトークン化エラー(無視して続行): {e}", "warning")
             prompt_ids = None
 
-    transcriptions = []  # type: ignore
-    chunk_errors = 0  # エラーカウント
-    
-    # インメモリチャンクプロバイダ: VAD で読み込んだ PCM を再利用（I/O ゼロ）
+    transcriptions: list[str] = []
+    chunk_errors = 0
+
     with InMemoryChunkProvider(audio, chunks) as chunk_provider:
         _log(f"[PROGRESS] チャンク読み込みモード: {chunk_provider.mode}")
-
-        if len(chunks) == 0:
-            _log("[PROGRESS] Whisper進捗: 100% (チャンク 0/0)")
-        else:
-            next_threshold = 20
+        next_threshold = 20 if chunks else 100
 
         for i in range(len(chunks)):
-            if len(chunks) > 0:
-                pct = (i + 1) * 100.0 / len(chunks)
-                is_last = i == len(chunks) - 1
-                if is_last:
-                    pct = 100.0
-
-                if pct >= next_threshold or is_last:
-                    elapsed = _time.time() - _inference_start
-                    pct_display = 100 if is_last else int(pct)
-                    _log(
-                        f"[PROGRESS] Whisper進捗: {pct_display}% (チャンク {i+1}/{len(chunks)}) - {elapsed:.0f}/{audio_duration_sec:.0f}秒"
-                    )
-
-                    if not is_last:
-                        # 次の節目(20%刻み)を計算。1チャンクにつき最大1行にするため while は使わない。
-                        next_threshold = (int(pct // 20) + 1) * 20
-                        if next_threshold > 100:
-                            next_threshold = 100
+            pct = (i + 1) * 100.0 / len(chunks)
+            is_last = i == len(chunks) - 1
+            if is_last or pct >= next_threshold:
+                elapsed = _time.time() - _inference_start
+                pct_display = 100 if is_last else int(pct)
+                _log(f"[PROGRESS] Whisper進捗: {pct_display}% (チャンク {i+1}/{len(chunks)}) - {elapsed:.0f}/{audio_duration_sec:.0f}秒")
+                if not is_last:
+                    next_threshold = (int(pct // 20) + 1) * 20
+                    next_threshold = min(next_threshold, 100)
 
             try:
-                # メモリからチャンクを取得（I/O ゼロ）
                 chunk_data = chunk_provider.get_chunk(i)
-                
                 if chunk_data is None or len(chunk_data) < 100:
                     continue
 
-                # 音声を処理
                 inputs = processor(chunk_data, sampling_rate=16000, return_tensors="pt")  # type: ignore
                 input_features = inputs.input_features.to(device).to(torch_dtype)  # type: ignore
 
-                with torch.no_grad():
-                    # generate 引数を構築
+                with torch.inference_mode():
                     generate_kwargs = {
                         "language": "ja",
                         "task": "transcribe",
@@ -1298,45 +1556,36 @@ def transcribe_long_audio(
                         "temperature": 0.0,
                         "no_repeat_ngram_size": 0,
                         "use_cache": True,
-                        "suppress_tokens": None,  # 抑制トークンを無効化
-                        "num_beams": 1,  # ビームサーチを無効化して感度向上
-                        "repetition_penalty": 1.0,  # 繰り返しペナルティを無効化
+                        "suppress_tokens": None,
+                        "num_beams": 1,
+                        "repetition_penalty": 1.0,
                     }
-                    
-                    # プロンプトがある場合は prompt_ids を追加
                     if prompt_ids is not None:
                         generate_kwargs["prompt_ids"] = prompt_ids
-                    
-                    generated_tokens = model.generate(  # pyright: ignore
-                        input_features,
-                        **generate_kwargs
-                    )
+
+                    generated_tokens = model.generate(input_features, **generate_kwargs)  # pyright: ignore[union-attr]
                     generated_tokens = cast(torch.Tensor, generated_tokens)  # pyright: ignore
 
-                transcription: str = processor.batch_decode(generated_tokens, skip_special_tokens=True)[0]  # type: ignore
+                transcription = processor.batch_decode(generated_tokens, skip_special_tokens=True)[0]  # type: ignore[union-attr]
+                del generated_tokens, input_features, inputs
+                if transcription.strip():
+                    transcriptions.append(transcription.strip())
+                del transcription, chunk_data
 
-                if transcription.strip():  # type: ignore  # 空でない場合のみ追加
-                    transcriptions.append(transcription.strip())  # type: ignore
-                    
             except torch.cuda.OutOfMemoryError as e:
-                # CUDA OOM: 致命的なエラーとして報告（復旧不能の可能性）
                 _log(f"[ERROR] GPU メモリ不足 (チャンク {i+1}/{len(chunks)}): {e}", "error")
-                _log("[ERROR] GPU メモリを解放して再試行を推奨", "error")
                 chunk_errors += 1
-                torch.cuda.empty_cache()  # 試しにキャッシュをクリア
+                torch.cuda.empty_cache()
             except Exception as e:
-                # その他のエラー: ログして続行
                 _log(f"[ERROR] チャンク {i+1}/{len(chunks)} 処理エラー: {e}", "error")
                 chunk_errors += 1
-                if chunk_errors > len(chunks) * 0.1:  # 10%以上失敗したら中断
+                if chunk_errors > len(chunks) * 0.1:
                     raise RuntimeError(f"エラー率が高すぎます ({chunk_errors}/{len(chunks)}チャンク失敗)") from e
 
-    # === メモリ解放: 推論完了後に PCM データを解放 ===
     del audio
     gc.collect()
-    _log(f"[PROGRESS] PCMデータ解放完了")
+    _log("[PROGRESS] PCMデータ解放完了")
 
-    # 推論完了サマリー
     _inference_time = _time.time() - _inference_start
     _total_time = _time.time() - _preprocess_start
     error_part = "" if chunk_errors <= 0 else f" / エラー発生チャンク: {chunk_errors}/{len(chunks)}"
@@ -1345,23 +1594,15 @@ def transcribe_long_audio(
         "warning" if chunk_errors > 0 else "info",
     )
 
-    # 全てのチャンクの結果を連結（改行区切り）
-    full_transcription = "\n".join(transcriptions)  # type: ignore
-
-    # ヘッダを付加（\\n を実際の改行に変換）
+    full_transcription = "\n".join(transcriptions)
     if header:
-        header_text = header.replace('\\n', '\n')
+        header_text = header.replace("\\n", "\n")
         full_transcription = header_text + "\n\n" + full_transcription
 
-    # テキストファイルに出力
-    audio_path = Path(audio_file)
-    if output_path:
-        output_file = Path(output_path)
-    else:
-        output_file = audio_path.with_suffix('.txt')
-
+    output_file = Path(output_path) if output_path else audio_path_obj.with_suffix(".txt")
     try:
-        with open(output_file, 'w', encoding='utf-8') as f:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, "w", encoding="utf-8") as f:
             f.write(full_transcription)
         _log(f"=== テキストファイルに保存完了: {output_file} ===")
     except Exception as e:
@@ -1369,17 +1610,18 @@ def transcribe_long_audio(
         raise RuntimeError(f"出力ファイル保存に失敗: {output_file}") from e
 
     _log(f"=== 文字起こし完了: {audio_path_obj.name} ({len(full_transcription)}文字) ===")
-
-    return full_transcription  # type: ignore
-
+    return full_transcription
 
 # メイン実行
 if __name__ == "__main__":
+    _configure_stdio_for_windows()
+    _register_signal_handlers()
     args = _parse_args()
     
     # 各音声ファイルを処理（終了時クリーンアップ保証）
     failed_files = []
     try:
+        init_models()
         for i, audio_file in enumerate(args.audio_files):
             try:
                 # 複数ファイル時は --output は使用不可（argparseでバリデーション済み）
@@ -1389,6 +1631,7 @@ if __name__ == "__main__":
                     prompt=args.prompt,
                     header=args.header,
                     output_path=output_path,
+                    vad_profile=args.vad_profile,
                 )
             except Exception as e:  # type: ignore
                 print(f"エラー: {audio_file} の処理中にエラーが発生しました: {e}")
