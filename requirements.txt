@@ -1,7 +1,7 @@
 --extra-index-url https://download.pytorch.org/whl/cu121
 torch==2.3.0+cu121
 torchvision==0.18.0+cu121
-torchaudio==2.3.0
+torchaudio==2.3.0+cu121
 cupy-cuda12x
 transformers
 librosa
@@ -11,4 +11,4 @@ soundfile
 av
 # noisereduce は削除（Silero VAD に置換、Whisper自体のノイズ耐性に依存）
 # silero-vad は torch.hub.load で自動ダウンロードされるため requirements 不要
-webrtcvad
+webrtcvad-wheels

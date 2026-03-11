@@ -21,6 +21,7 @@ import os
 import subprocess
 import shutil
 import logging
+import warnings
 from pathlib import Path
 from typing import cast, Optional
 import signal
@@ -121,6 +122,7 @@ except ImportError:
 import torch
 from pydub import AudioSegment  # type: ignore
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+from transformers.utils import is_flash_attn_2_available
 
 has_silero_vad = False
 _vad_model = None
@@ -570,11 +572,62 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 model = None
 processor = None
+_resolved_attn_implementation: Optional[str] = None
+
+
+def _torch_compiled_flash_attention_available() -> bool:
+    """PyTorch wheel が FlashAttention カーネルを内包しているか簡易判定する。"""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        q = torch.randn(1, 8, 16, 64, device=device, dtype=torch.float16)
+        k = torch.randn(1, 8, 16, 64, device=device, dtype=torch.float16)
+        v = torch.randn(1, 8, 16, 64, device=device, dtype=torch.float16)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _ = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        return not any(
+            "not compiled with flash attention" in str(w.message).lower()
+            for w in caught
+        )
+    except Exception:
+        return False
+    finally:
+        try:
+            del q, k, v
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+
+def _resolve_attention_implementation() -> tuple[Optional[str], str]:
+    """この環境で到達可能な最適 attention 実装を選ぶ。"""
+    forced = (os.getenv("WHISPER_ATTN_IMPLEMENTATION") or "").strip()
+    if forced:
+        return forced, f"環境変数で明示指定: {forced}"
+
+    if is_flash_attn_2_available():
+        return "flash_attention_2", "flash-attn 2 利用可能"
+
+    if torch.cuda.is_available():
+        if _torch_compiled_flash_attention_available():
+            return "sdpa", "PyTorch SDPA + compiled FlashAttention 利用可能"
+        try:
+            torch.backends.cuda.enable_flash_sdp(False)
+        except Exception:
+            pass
+        return "sdpa", "PyTorch SDPA を使用（この Torch ビルドでは FlashAttention 未コンパイル）"
+
+    return "eager", "CPU 実行のため eager attention を使用"
 
 
 def init_models() -> None:
     """Whisper（とVAD）を初期化（import時に重い処理をしないため遅延ロード）。"""
-    global model, processor, _CLEANED
+    global model, processor, _CLEANED, _resolved_attn_implementation
     with _models_init_lock:
         if model is not None and processor is not None:
             return
@@ -588,12 +641,40 @@ def init_models() -> None:
 
         # Whisper モデル/プロセッサ初期化
         _log("Whisper モデルをロード中...")
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(  # type: ignore
-            model_id,
-            dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        ).to(device)
+        attn_implementation, attn_reason = _resolve_attention_implementation()
+        _resolved_attn_implementation = attn_implementation
+        if attn_implementation:
+            _log(f"attention 実装: {attn_implementation} ({attn_reason})")
+        else:
+            _log(f"attention 実装: 自動 ({attn_reason})")
+
+        model_kwargs = {
+            "dtype": torch_dtype,
+            "low_cpu_mem_usage": True,
+            "trust_remote_code": True,
+        }
+        if attn_implementation:
+            model_kwargs["attn_implementation"] = attn_implementation
+
+        try:
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(  # type: ignore
+                model_id,
+                **model_kwargs,
+            ).to(device)
+        except TypeError as e:
+            if attn_implementation and "attn_implementation" in str(e):
+                _log(
+                    f"attention 実装指定に未対応のため自動設定へフォールバック: {e}",
+                    "warning",
+                )
+                model_kwargs.pop("attn_implementation", None)
+                _resolved_attn_implementation = None
+                model = AutoModelForSpeechSeq2Seq.from_pretrained(  # type: ignore
+                    model_id,
+                    **model_kwargs,
+                ).to(device)
+            else:
+                raise
         processor = AutoProcessor.from_pretrained(model_id)  # type: ignore
         _log("Whisper モデルロード完了")
 
