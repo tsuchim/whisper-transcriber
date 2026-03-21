@@ -2,13 +2,12 @@
 torch==2.3.0+cu121
 torchvision==0.18.0+cu121
 torchaudio==2.3.0+cu121
-cupy-cuda12x
-transformers
-librosa
+accelerate==1.2.1
+huggingface-hub==0.27.1
 numpy<2
-pydub
-soundfile
-av
-# noisereduce は削除（Silero VAD に置換、Whisper自体のノイズ耐性に依存）
-# silero-vad は torch.hub.load で自動ダウンロードされるため requirements 不要
-webrtcvad-wheels
+onnxruntime==1.20.1
+punctuators==0.0.5
+pyannote.audio==3.3.2
+soundfile==0.13.0
+transformers==4.48.0
+diarizers @ git+https://github.com/huggingface/diarizers.git@f3c8ae500f55ad2b02b719fce1495ea2794ca9fe

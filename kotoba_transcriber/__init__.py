@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Backward-compatible CLI entry point for kotoba-whisper v2.2."""
+"""kotoba-whisper v2.2 transcription entry points."""
 
 from kotoba_transcriber.engine import (
     MODEL_ID,
@@ -21,7 +21,3 @@ __all__ = [
     "transcribe_file",
     "transcribe_long_audio",
 ]
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
