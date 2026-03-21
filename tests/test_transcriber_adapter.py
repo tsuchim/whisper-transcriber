@@ -13,11 +13,17 @@ class TestTranscriberAdapter(TestCase):
         assert spec is not None and spec.loader is not None
         spec.loader.exec_module(module)
 
+        captured = {}
+
+        def fake_transcribe_long_audio(**kwargs):
+            captured.update(kwargs)
+            Path(kwargs["output_path"]).write_text("ok", encoding="utf-8")
+
         fake_whisper = type(
             "FakeWhisper",
             (),
             {
-                "transcribe_long_audio": staticmethod(lambda **kwargs: Path(kwargs["output_path"]).write_text("ok", encoding="utf-8")),
+                "transcribe_long_audio": staticmethod(fake_transcribe_long_audio),
                 "offload_model": staticmethod(lambda: None),
                 "restore_model": staticmethod(lambda: None),
                 "set_logger": staticmethod(lambda logger: None),
@@ -33,6 +39,8 @@ class TestTranscriberAdapter(TestCase):
                     prompt="p",
                     header="h",
                     vad_profile="fast",
+                    chunk_length_s=42,
                 )
                 self.assertEqual(result, str(output_path))
                 self.assertEqual(output_path.read_text(encoding="utf-8"), "ok")
+                self.assertEqual(captured["chunk_length_s"], 42)

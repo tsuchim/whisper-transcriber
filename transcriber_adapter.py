@@ -49,6 +49,7 @@ def transcribe_file(
         header=header,
         output_path=output_path,
         vad_profile=vad_profile or "auto",
+        **kwargs,
     )
     return output_path
 

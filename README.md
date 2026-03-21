@@ -15,7 +15,7 @@
 - 話者分離: `pyannote/speaker-diarization-3.1`
 - 日本語話者分離補助: `diarizers-community/speaker-segmentation-fine-tuned-callhome-jpn`
 - 句読点: `punctuators`
-- 推論経路: Hugging Face `pipeline(task="automatic-speech-recognition", trust_remote_code=True)`
+- 推論経路: Hugging Face `pipeline(task="kotoba-whisper", trust_remote_code=True)`
 
 つまり、`AutoModelForSpeechSeq2Seq + generate()` を直接回す構成ではありません。
 
