@@ -1,239 +1,181 @@
 # whisper-transcriber
 
-## 概要
+`kotoba-whisper-v2.2` を **公式 pipeline ベース** で使うための文字起こしラッパです。
 
-CUDA12.1 + Python3.12環境で動作する**高速日本語音声認識ツール**です。
+このリポジトリは plain ASR 専用ではありません。`v2.2` の価値である以下を有効にします。
 
-- **モデル**: kotoba-whisper-v2.2（日本語特化）
-- **前処理**: Silero VAD（ニューラルネット音声検出）で従来比100倍高速化
-- **対応形式**: MP3, MP4, FLV, MKV, WAV, WebM等の音声・動画ファイル
-- **GPU対応**: CUDA/CPU自動判定、CuPy GPU加速対応
+- speaker diarization
+- punctuation postprocessing
 
-### 処理時間の目安（NVIDIA GPU環境）
+`whisper-v3.py` は後方互換の CLI 名として残し、実体は `kotoba_transcriber/` に分離しています。`live-scraping` など外部アプリケーションからはトップレベルの `transcriber_adapter.py` を参照してください。
 
-| 音声長 | 推定時間 | スピードアップ |
-|--------|---------|--------------|
-| 10分 | 10-20秒 | 約30-60倍 |
-| 1時間 | 1-2分 | 約20-40倍 |
-| 3時間 | 3-5分 | 約20-40倍 |
+## 動作方針
 
-※旧版（noisereduce利用）比較：10分で3-5分かかっていたのが10-20秒に短縮
+- モデル: `kotoba-tech/kotoba-whisper-v2.2`
+- 話者分離: `pyannote/speaker-diarization-3.1`
+- 日本語話者分離補助: `diarizers-community/speaker-segmentation-fine-tuned-callhome-jpn`
+- 句読点: `punctuators`
+- 推論経路: Hugging Face `pipeline(task="kotoba-whisper", trust_remote_code=True)`
 
-## 主な改善点（v2.0）
+つまり、`AutoModelForSpeechSeq2Seq + generate()` を直接回す構成ではありません。
 
-### 1. Silero VAD による高速音声検出
+## 出力
 
-- **従来**: pydub（音量ベース）→ 遅い、音量差で見落とし
-- **現在**: Silero VAD（ニューラルネット）→ **100倍高速**、小さな声も検出
+単一入力 `sample.wav` に対して、以下を生成します。
 
-実装:
-```python
-# 音量に関係なく「人の声」を検出
-speech_timestamps = get_speech_timestamps(
-    audio, 
-    model,
-    threshold=0.3,               # 高感度
-    min_speech_duration_ms=100,  # 短い発話も検出
-    speech_pad_ms=100            # マージン付与
-)
+- `sample.txt`
+  - 話者ラベル付きの時系列テキスト
+- `sample.transcript.json`
+  - 正規化済みメタデータ
+  - `text`
+  - `segments`
+  - `language`
+  - `engine`
+  - `model`
+  - `speakers`
+
+`sample.txt` の例:
+
+```text
+SPEAKER_00: 今日はよろしくお願いします。
+SPEAKER_01: はい、お願いします。
+SPEAKER_00: それでは始めます。
 ```
 
-### 2. ノイズ除去の削除
+## セットアップ
 
-- **従来**: noisereduce (stationary=False) → 10-30分かかる
-- **現在**: 削除 → **Whisper自体のノイズ耐性に依存**
+前提:
 
-Whisperはノイズの多い環境でも高精度のため、前処理でのノイズ除去は不要と判定。
+- Python 3.12
+- FFmpeg が PATH にあること
+- Hugging Face にログインできること
+- `pyannote/speaker-diarization-3.1` の利用規約を事前承諾していること
 
-### 3. ベクトル演算による高速化
+セットアップ:
 
-- **従来**: Python forループで音量分析 → 1-3分
-- **現在**: numpy/CuPy ベクトル演算 → **数秒**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+hf auth login
+```
+
+Windows PowerShell:
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+hf auth login
+```
 
 ## 使い方
 
-### 基本
+基本:
 
 ```bash
-python whisper-v3.py audio.mp3
-python whisper-v3.py video.mp4 video2.flv  # 複数ファイル対応
+python3 whisper-v3.py audio.mp3
+python3 whisper-v3.py video.mp4 another.flv
 ```
 
-### オプション
-
-| オプション | 短縮形 | 説明 |
-|-----------|--------|------|
-| `--prompt` | `-p` | AIに渡すプロンプト文字列（文脈情報、話者名など） |
-| `--header` | `-H` | 出力ファイルの冒頭に付加するヘッダー（`\n` で改行） |
-| `--output` | `-o` | 出力ファイルパス（単一ファイル処理時のみ有効） |
-| `--vad-profile` |  | VADの優先順位プロファイル（`auto`/`fast`/`accurate`） |
-
-### 使用例
+プロンプトや話者数制約を付ける例:
 
 ```bash
-# 基本的な文字起こし
-python whisper-v3.py audio.mp3
-
-# プロンプトを指定（AIの精度向上）
-python whisper-v3.py video.mp4 --prompt "配信者: 山田太郎。キーワード: ゲーム配信"
-
-# ヘッダー付きで出力
-python whisper-v3.py audio.flv --header "配信: 山田太郎\n日時: 2025-01-01 12:00"
-
-# 出力ファイルを指定
-python whisper-v3.py audio.flv --output /path/to/output.txt
-
-# VADを軽量優先（環境依存のため自動でフォールバックします）
-python whisper-v3.py audio.mp3 --vad-profile fast
+python3 whisper-v3.py meeting.mp3 \
+  --prompt "配信者: 山田太郎。会議テーマ: 月次レビュー。" \
+  --min-speakers 2 \
+  --max-speakers 4
 ```
 
-### `--vad-profile` の詳細
-
-VAD（音声区間検出）のバックエンドは、環境や依存関係に応じて自動でフォールバックします。
-
-- `auto`（既定）: 精度優先の既定順序（Silero → WebRTC VAD → pydub）
-- `fast`: 軽量・高速優先（WebRTC VAD → Silero → pydub）
-- `accurate`: 高精度優先（Silero → WebRTC VAD → pydub）
-
-※ `webrtcvad` を使うには `pip install webrtcvad` が必要です（`requirements.txt` に含まれます）。
-
-## インストール手順
-
-### 前提条件
-
-- Python 3.12.x
-- NVIDIA GPU（CUDA 12.1対応ドライバ）
-  - CPU環境でも動作しますが、処理時間は大幅に長くなります
-  - 推奨: VRAM 4GB以上（FP16モード）
-
-### セットアップ
+句読点を無効化する例:
 
 ```bash
-# 1. 仮想環境を作成（推奨）
-python -m venv .venv
-.venv\Scripts\Activate.ps1  # Windows
-source .venv/bin/activate    # Linux/Mac
-
-# 2. 依存パッケージをインストール
-pip install -r requirements.txt
+python3 whisper-v3.py interview.wav --no-punctuation
 ```
 
-**注意**: PyTorch GPU版は `requirements.txt` の `--extra-index-url` から自動インストール。詳細は [PyTorch公式](https://pytorch.org/get-started/locally/) を参照。
+単一ファイルの出力先を明示する例:
+
+```bash
+python3 whisper-v3.py audio.flv --output /path/to/output.txt
+```
+
+## オプション
+
+- `--prompt`, `-p`: Whisper prompt
+- `--header`, `-H`: テキスト先頭ヘッダー
+- `--output`, `-o`: 出力 `.txt` パス
+- `--chunk-length-s`: ASR chunk 長
+- `--stride-length-s`: ASR stride 長
+- `--batch-size`: pipeline batch size
+- `--num-speakers`: 話者数固定
+- `--min-speakers`: 最小話者数
+- `--max-speakers`: 最大話者数
+- `--add-silence-start`: 各話者区間の前に足す無音秒数
+- `--add-silence-end`: 各話者区間の後に足す無音秒数
+- `--no-punctuation`: 句読点後処理を無効化
+
+## 外部アプリ連携
+
+外部アプリケーションからは `transcriber_adapter.py` を読み込みます。
+
+公開 API:
+
+- `transcribe_file(audio_file, output_path, prompt=None, header=None, vad_profile=None, **kwargs)`
+- `restore_model()`
+- `offload_model()`
+- `set_logger(logger)`
+
+`vad_profile` は後方互換のため残していますが、この実装では使いません。
+
+## 環境変数
+
+必要に応じて以下で既定値を上書きできます。
+
+- `KOTOBA_DEVICE`
+- `KOTOBA_DEVICE_PYANNOTE`
+- `KOTOBA_TORCH_DTYPE`
+- `KOTOBA_ATTN_IMPLEMENTATION`
+- `KOTOBA_BATCH_SIZE`
+- `KOTOBA_CHUNK_LENGTH_S`
+- `KOTOBA_STRIDE_LENGTH_S`
+- `KOTOBA_ADD_PUNCTUATION`
+- `KOTOBA_NUM_SPEAKERS`
+- `KOTOBA_MIN_SPEAKERS`
+- `KOTOBA_MAX_SPEAKERS`
+- `KOTOBA_ADD_SILENCE_START`
+- `KOTOBA_ADD_SILENCE_END`
+- `KOTOBA_MODEL_PYANNOTE`
+- `KOTOBA_MODEL_DIARIZERS`
+- `HUGGINGFACE_HUB_TOKEN`
+
+## 依存バージョン方針
+
+- `transformers==4.48.0`、`huggingface-hub==0.27.1`、`pyannote.audio==3.3.2`、`diarizers` の固定コミットは、このリポジトリで検証した既知の動作組み合わせを再現するために固定しています。
+- `huggingface-hub==0.27.1` は、このリポジトリ側の互換性固定です。`kotoba-whisper-v2.2` 自体の上流要件としてこの exact version を要求していることまでは確認していません。
+- これらを更新する場合は、pipeline 初期化、Hugging Face 認証、pyannote の話者分離、句読点後処理までまとめて再確認してください。
+
+### 認証 CLI に関する運用メモ
+
+- 2026-03-21 時点で、利用環境によっては `huggingface-cli login` 実行時に `Warning: 'huggingface-cli login' is deprecated. Use 'hf auth login' instead.` が表示されることを確認しています。
+- 2026-03-21 の変更では、`huggingface-hub==0.27.1` を含む依存固定を導入しました。
+- 同日、この警告への対応要望があったにもかかわらず、その時点では README と案内文の修正を行わず、警告が出る状態を残していました。
+- 現在の README と案内文は `hf auth login` に更新しています。将来の CLI 仕様変更時は、README の手順、エラーメッセージ、および依存バージョン方針をまとめて見直してください。
+
+## 運用上の注意
+
+- 初回起動時はモデルダウンロードに時間がかかります。
+- `pyannote` 系モデルは Hugging Face の認証と利用規約承諾が必要です。
+- `v2.2` の話者分離と句読点を使うため、plain ASR より依存は重いです。
+- モデル退避は GPU からの完全解放を優先し、`offload_model()` では pipeline オブジェクトを破棄します。
 
 ## 開発
 
 ```bash
-python -m unittest discover -s tests
+python3 -m unittest discover -s tests
 ```
-
-## 前処理パイプラインの詳細
-
-### 処理フロー
-
-```
-1. 音声読み込み (PyAV/ffmpeg/librosa)
-   ↓
-2. RMS正規化 (高速ベクトル演算)
-   ↓
-3. Silero VAD 音声区間検出 (ニューラルネット)
-   ↓
-4. セグメント毎の音量分析 (小さな声保護)
-   ↓
-5. チャンク分割 (Whisper処理用)
-   ↓
-6. 音声認識 (kotoba-whisper-v2.2)
-```
-
-### 各ステップの特徴
-
-| ステップ | 時間 | 目的 |
-|---------|------|------|
-| **音声読み込み** | 〜10秒 | 16kHz/mono/PCMへの統一 |
-| **RMS正規化** | 〜1秒 | 全体レベルを-20dBFSに統一 |
-| **Silero VAD** | 〜10秒 | 発話区間を高速検出（音量非依存） |
-| **音量分析** | 〜1秒 | 小さい発話（-35dB以下）を検出 |
-| **チャンク分割** | 〜1秒 | 25秒以下の処理単位に分割 |
-| **Whisper推論** | 大部分 | GPU/CPU処理 |
-
-### 小さな声の処理
-
-Silero VAD + 軽微なダイナミクス圧縮:
-
-```python
-# 小さな発話（-35dB以下）に軽微な圧縮を適用
-if min_segment_db < -35:
-    audio_segment = compress_dynamic_range(
-        audio_segment, 
-        threshold=-35.0, 
-        ratio=3.0,        # 軽微な圧縮
-        attack=5.0, 
-        release=50.0
-    )
-```
-
-## トラブルシューティング
-
-### Silero VAD が見つからない場合
-
-```
-警告: Silero VAD が利用不可のため pydub を使用（低速）
-```
-
-**原因**: torch.hub が Silero VAD をダウンロードできていない
-
-**対処法**:
-```python
-# 手動ダウンロード
-import torch
-torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True)
-```
-
-### GPU メモリ不足
-
-**症状**: CUDA Out of Memory エラー
-
-**対処法**:
-1. 同時実行を避ける
-2. CPU実行に切り替え（遅いが安定）
-3. GPU メモリ解放: `nvidia-smi`で確認後、再起動
-
-## 主要ファイル
-
-- `whisper-v3.py` : 音声認識メインスクリプト
-- `requirements.txt` : 依存パッケージリスト（GPU対応）
-- `README.md` : このファイル
-- `LICENSE` : Apache License 2.0
-
-## ライセンスについて
-
-本プロジェクトは Apache License 2.0 を採用しています。これは使用している主要ライブラリ（PyTorch、Transformers等）のライセンスとの互換性を考慮した選択です。
 
 ## 参考資料
 
-- **Silero VAD**: https://github.com/snakers4/silero-vad
-- **Whisper論文**: https://arxiv.org/abs/2212.04356
-- **kotoba-whisper**: https://huggingface.co/kotoba-tech/kotoba-whisper-v2.2
-- **PyTorch公式**: https://pytorch.org/get-started/locally/
-
-## コーディングに使用したAI
-
-- GitHub Copilot Chat（Claude Haiku 4.5）
-- 設計・分析: Cursor/Claude Sonnet
-
-## 更新履歴
-
-### v2.0 (2025-12)
-
-- **Silero VAD 導入**: 前処理を100倍高速化
-- **noisereduce 削除**: Whisper自体のノイズ耐性に依存
-- **ベクトル演算化**: 音量分析を高速化
-- ドキュメント刷新
-
-### v1.0 (2025-08)
-
-- 初版リリース
-- noisereduce + pydub による音声前処理
-
----
-
-ご質問・不具合は GitHub Issues へどうぞ。
+- kotoba-whisper v2.2: https://huggingface.co/kotoba-tech/kotoba-whisper-v2.2
+- pyannote speaker diarization: https://huggingface.co/pyannote/speaker-diarization-3.1
+- PyTorch: https://pytorch.org/get-started/locally/
