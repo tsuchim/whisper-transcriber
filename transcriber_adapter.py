@@ -54,14 +54,13 @@ def transcribe_file(
     return output_path
 
 
-def offload_model() -> None:
+def offload_model(**kwargs) -> None:
     module = _load_whisper_module()
     if hasattr(module, "offload_model"):
-        module.offload_model()
+        module.offload_model(**kwargs)
 
 
-def restore_model() -> None:
+def restore_model(**kwargs) -> None:
     module = _load_whisper_module()
     if hasattr(module, "restore_model"):
-        module.restore_model()
-
+        module.restore_model(**kwargs)

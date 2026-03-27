@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib
 import io
 import json
 import logging
@@ -81,6 +82,22 @@ def _import_pipeline_factory():
     except ImportError as exc:
         raise RuntimeError("transformers が必要です。`pip install -r requirements.txt` を実行してください。") from exc
     return hf_pipeline
+
+
+def _import_ffmpeg_read():
+    try:
+        from transformers.pipelines.audio_utils import ffmpeg_read  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("transformers の audio_utils が必要です。`pip install -r requirements.txt` を実行してください。") from exc
+    return ffmpeg_read
+
+
+def _import_numpy():
+    try:
+        import numpy as np  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("NumPy が必要です。`pip install -r requirements.txt` を実行してください。") from exc
+    return np
 
 
 def _flash_attention_2_available() -> bool:
@@ -241,6 +258,9 @@ def _get_auth_token() -> Optional[str]:
 
 
 def _create_pipeline(config: dict[str, Any]):
+    _patch_pyannote_stats_pool()
+    _normalize_speechbrain_redirect()
+    _configure_torch_backends(config)
     hf_pipeline = _import_pipeline_factory()
     model_kwargs = {
         "low_cpu_mem_usage": True,
@@ -279,6 +299,89 @@ def _create_pipeline(config: dict[str, Any]):
         ) from exc
 
 
+def _normalize_speechbrain_redirect() -> None:
+    """speechbrain の deprecated redirect を実体 module に置き換える。"""
+    try:
+        speechbrain = importlib.import_module("speechbrain")
+        inference = importlib.import_module("speechbrain.inference")
+    except Exception:
+        return
+
+    if getattr(speechbrain, "pretrained", None) is not inference:
+        setattr(speechbrain, "pretrained", inference)
+    if sys.modules.get("speechbrain.pretrained") is not inference:
+        sys.modules["speechbrain.pretrained"] = inference
+
+
+def _configure_torch_backends(config: dict[str, Any]) -> None:
+    if not (
+        str(config.get("device") or "").startswith("cuda")
+        or str(config.get("device_pyannote") or "").startswith("cuda")
+    ):
+        return
+
+    try:
+        torch = _import_torch()
+    except Exception:
+        return
+
+    if hasattr(torch.backends, "cudnn"):
+        if hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = True
+
+
+def _patch_pyannote_stats_pool() -> None:
+    """pyannote の 1-frame 入力で不要な std 警告が出る経路を補正する。"""
+    try:
+        from pyannote.audio.models.blocks.pooling import StatsPool  # type: ignore
+    except Exception:
+        return
+
+    original_forward = getattr(StatsPool, "forward", None)
+    if original_forward is None or getattr(original_forward, "_codex_safe_stats_pool", False):
+        return
+
+    torch = _import_torch()
+
+    def safe_forward(self: Any, sequences: Any, weights: Optional[Any] = None) -> Any:
+        if weights is None:
+            try:
+                num_frames = int(sequences.size(-1))
+            except Exception:
+                num_frames = None
+            if num_frames is not None and num_frames <= 1:
+                mean = sequences.mean(dim=-1)
+                std = sequences.std(dim=-1, correction=0)
+                return torch.cat([mean, std], dim=-1)
+        return original_forward(self, sequences, weights=weights)
+
+    safe_forward._codex_safe_stats_pool = True  # type: ignore[attr-defined]
+    StatsPool.forward = safe_forward
+
+
+def _build_inference_kwargs(config: dict[str, Any], generate_kwargs: dict[str, Any]) -> dict[str, Any]:
+    inference_kwargs = {
+        "chunk_length_s": config["chunk_length_s"],
+        "add_punctuation": config["add_punctuation"],
+        "generate_kwargs": generate_kwargs,
+    }
+    if config["stride_length_s"] is not None:
+        inference_kwargs["stride_length_s"] = config["stride_length_s"]
+    if config["num_speakers"] is not None:
+        inference_kwargs["num_speakers"] = config["num_speakers"]
+    if config["min_speakers"] is not None:
+        inference_kwargs["min_speakers"] = config["min_speakers"]
+    if config["max_speakers"] is not None:
+        inference_kwargs["max_speakers"] = config["max_speakers"]
+    if config["add_silence_start"] is not None:
+        inference_kwargs["add_silence_start"] = config["add_silence_start"]
+    if config["add_silence_end"] is not None:
+        inference_kwargs["add_silence_end"] = config["add_silence_end"]
+    return inference_kwargs
+
+
 def _get_or_create_pipeline(**overrides: Any):
     global _PIPELINE, _PIPELINE_SIGNATURE
 
@@ -291,15 +394,19 @@ def _get_or_create_pipeline(**overrides: Any):
 
         _log(
             "kotoba-whisper v2.2 pipeline をロード中: "
-            f"model={config['model_id']} device={config['device']} diarization={config['model_pyannote']}",
+            "model="
+            f"{config['model_id']} device={config['device']} "
+            f"device_pyannote={config['device_pyannote']} diarization={config['model_pyannote']}",
         )
         _PIPELINE = _create_pipeline(config)
+        _patch_pipeline_forward(_PIPELINE)
         _patch_pipeline_postprocess(_PIPELINE)
         _PIPELINE_SIGNATURE = signature
         return _PIPELINE
 
 
-def offload_model() -> None:
+def offload_model(**kwargs: Any) -> None:
+    del kwargs
     global _PIPELINE, _PIPELINE_SIGNATURE
     with _pipeline_lock:
         _PIPELINE = None
@@ -315,8 +422,8 @@ def offload_model() -> None:
     _log("kotoba-whisper pipeline を解放しました", "debug")
 
 
-def restore_model() -> None:
-    _get_or_create_pipeline()
+def restore_model(**kwargs: Any) -> None:
+    _get_or_create_pipeline(**kwargs)
 
 
 def _metadata_path(output_path: Path) -> Path:
@@ -328,6 +435,86 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _patch_pipeline_forward(pipe: Any) -> Any:
+    """Monkey-patch _forward to capture avg_logprob from model.generate().
+
+    With return_timestamps=True, Whisper's generate() returns a dict
+    {"sequences": tensor, "segments": list} where segments[batch_i] is a list
+    of segment dicts each containing a "result" dict with "scores" and "sequences".
+    We compute per-batch-item avg_logprob from these nested scores and return it
+    as a tensor so that the pipeline framework unbatches it correctly.
+    """
+    if getattr(pipe, "_codex_metadata_forward", False):
+        return pipe
+
+    torch = _import_torch()
+
+    def _compute_segment_logprob(seg_result: dict[str, Any]) -> tuple[float, int]:
+        scores = seg_result.get("scores")
+        seg_seqs = seg_result.get("sequences")
+        if not scores or seg_seqs is None:
+            return 0.0, 0
+        seq_flat = seg_seqs.flatten()
+        offset = len(seq_flat) - len(scores)
+        total = 0.0
+        count = 0
+        for j, step_logits in enumerate(scores):
+            logits_flat = step_logits.flatten().float()
+            tid = seq_flat[offset + j].item()
+            if logits_flat[tid].item() == float("-inf"):
+                break
+            lp = torch.nn.functional.log_softmax(logits_flat, dim=-1)
+            total += lp[tid].item()
+            count += 1
+        return total, count
+
+    def metadata_forward(self: Any, model_inputs: dict[str, Any], **generate_kwargs: Any) -> dict[str, Any]:
+        generate_kwargs["attention_mask"] = model_inputs.pop("attention_mask", None)
+        generate_kwargs["input_features"] = model_inputs.pop("input_features")
+        generate_kwargs["output_scores"] = True
+        generate_kwargs["return_dict_in_generate"] = True
+
+        result = self.model.generate(**generate_kwargs)
+
+        if isinstance(result, dict):
+            sequences = result["sequences"]
+            segments_list = result.get("segments", [])
+        else:
+            sequences = getattr(result, "sequences", result)
+            segments_list = getattr(result, "segments", None) or []
+
+        batch_size = sequences.shape[0]
+        avg_logprobs: list[float] = []
+        for bi in range(batch_size):
+            if bi < len(segments_list) and isinstance(segments_list[bi], list):
+                total = 0.0
+                count = 0
+                for seg in segments_list[bi]:
+                    seg_result = seg.get("result") if isinstance(seg, dict) else None
+                    if not isinstance(seg_result, dict):
+                        continue
+                    try:
+                        t, c = _compute_segment_logprob(seg_result)
+                        total += t
+                        count += c
+                    except Exception:
+                        pass
+                avg_logprobs.append(round(total / count, 6) if count > 0 else float("nan"))
+            else:
+                avg_logprobs.append(float("nan"))
+
+        del segments_list
+        if isinstance(result, dict):
+            result.pop("segments", None)
+
+        avg_logprob_tensor = torch.tensor(avg_logprobs, dtype=torch.float32)
+        return {"tokens": sequences, "avg_logprob": avg_logprob_tensor, **model_inputs}
+
+    pipe._forward = MethodType(metadata_forward, pipe)
+    pipe._codex_metadata_forward = True
+    return pipe
 
 
 def _patch_pipeline_postprocess(pipe: Any) -> Any:
@@ -355,6 +542,13 @@ def _patch_pipeline_postprocess(pipe: Any) -> Any:
             )
             speaker_span = output.get("speaker_span") or [0.0, 0.0]
             span_start = _safe_float(speaker_span[0] if len(speaker_span) > 0 else 0.0)
+            span_end = _safe_float(speaker_span[1] if len(speaker_span) > 1 else 0.0)
+            raw_logprob = output.get("avg_logprob")
+            if raw_logprob is not None:
+                val = raw_logprob.item() if hasattr(raw_logprob, "item") else float(raw_logprob)
+                chunk_avg_logprob = round(val, 6) if val == val else None
+            else:
+                chunk_avg_logprob = None
             chunk_items = chunks.get("chunks") if isinstance(chunks, dict) else []
             if not isinstance(chunk_items, list):
                 continue
@@ -374,6 +568,9 @@ def _patch_pipeline_postprocess(pipe: Any) -> Any:
                     round(span_start + rel_end, 2),
                 ]
                 item["speaker_id"] = output.get("speaker_id")
+                item["avg_logprob"] = chunk_avg_logprob
+                item["speaker_span_start"] = round(span_start, 2)
+                item["speaker_span_end"] = round(span_end, 2)
                 outputs["chunks"].append(item)
 
         outputs["speaker_ids"] = sorted(
@@ -419,6 +616,9 @@ def _normalize_segments(raw_result: dict[str, Any]) -> list[dict[str, Any]]:
                 "end": round(end, 2),
                 "speaker": str(chunk.get("speaker_id") or "UNKNOWN"),
                 "text": text,
+                "avg_logprob": chunk.get("avg_logprob"),
+                "speaker_span_start": chunk.get("speaker_span_start"),
+                "speaker_span_end": chunk.get("speaker_span_end"),
             }
         )
 
@@ -442,6 +642,20 @@ def _collapse_segments(segments: list[dict[str, Any]], merge_gap_s: float = DEFA
         if same_speaker and gap <= merge_gap_s:
             previous["end"] = max(float(previous["end"]), float(segment["end"]))
             previous["text"] = f"{previous['text']}{segment['text']}"
+            prev_lp = previous.get("avg_logprob")
+            seg_lp = segment.get("avg_logprob")
+            if prev_lp is not None and seg_lp is not None:
+                previous["avg_logprob"] = min(prev_lp, seg_lp)
+            elif seg_lp is not None:
+                previous["avg_logprob"] = seg_lp
+            prev_ss = previous.get("speaker_span_start")
+            seg_ss = segment.get("speaker_span_start")
+            if prev_ss is not None and seg_ss is not None:
+                previous["speaker_span_start"] = min(prev_ss, seg_ss)
+            prev_se = previous.get("speaker_span_end")
+            seg_se = segment.get("speaker_span_end")
+            if prev_se is not None and seg_se is not None:
+                previous["speaker_span_end"] = max(prev_se, seg_se)
         else:
             collapsed.append(dict(segment))
 
@@ -543,6 +757,20 @@ def _write_metadata(output_path: Path, metadata: dict[str, Any]) -> None:
     )
 
 
+def _load_audio_input(input_path: Path, sampling_rate: int) -> dict[str, Any]:
+    ffmpeg_read = _import_ffmpeg_read()
+    np = _import_numpy()
+
+    audio = ffmpeg_read(input_path.read_bytes(), sampling_rate)
+    audio_array = np.array(audio, copy=True)
+    if not audio_array.flags.writeable:
+        audio_array.setflags(write=True)
+    return {
+        "array": audio_array,
+        "sampling_rate": sampling_rate,
+    }
+
+
 def transcribe_long_audio(
     audio_file: str,
     prompt: Optional[str] = None,
@@ -561,27 +789,11 @@ def transcribe_long_audio(
     pipe = _get_or_create_pipeline(**kwargs)
     config = _resolve_pipeline_config(**kwargs)
     generate_kwargs = _build_generate_kwargs(pipe, prompt)
-
-    inference_kwargs = {
-        "chunk_length_s": config["chunk_length_s"],
-        "add_punctuation": config["add_punctuation"],
-        "generate_kwargs": generate_kwargs,
-    }
-    if config["stride_length_s"] is not None:
-        inference_kwargs["stride_length_s"] = config["stride_length_s"]
-    if config["num_speakers"] is not None:
-        inference_kwargs["num_speakers"] = config["num_speakers"]
-    if config["min_speakers"] is not None:
-        inference_kwargs["min_speakers"] = config["min_speakers"]
-    if config["max_speakers"] is not None:
-        inference_kwargs["max_speakers"] = config["max_speakers"]
-    if config["add_silence_start"] is not None:
-        inference_kwargs["add_silence_start"] = config["add_silence_start"]
-    if config["add_silence_end"] is not None:
-        inference_kwargs["add_silence_end"] = config["add_silence_end"]
+    inference_kwargs = _build_inference_kwargs(config, generate_kwargs)
+    audio_input = _load_audio_input(input_path, pipe.feature_extractor.sampling_rate)
 
     _log(f"文字起こし開始: {input_path.name}")
-    raw_result = pipe(str(input_path), **inference_kwargs)
+    raw_result = pipe(audio_input, **inference_kwargs)
     if not isinstance(raw_result, dict):
         raise RuntimeError("kotoba-whisper pipeline が想定外の形式を返しました")
 
