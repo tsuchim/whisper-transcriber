@@ -757,6 +757,15 @@ def _write_metadata(output_path: Path, metadata: dict[str, Any]) -> None:
     )
 
 
+def _annotate_segments_from_env(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not _env("KOTOBA_HALLUCINATION_PRIORS_PATH"):
+        return segments
+
+    from kotoba_transcriber.hallucination_priors import annotate_segments_from_env
+
+    return annotate_segments_from_env(segments)
+
+
 def _load_audio_input(input_path: Path, sampling_rate: int) -> dict[str, Any]:
     ffmpeg_read = _import_ffmpeg_read()
     np = _import_numpy()
@@ -808,7 +817,7 @@ def transcribe_long_audio(
 
     metadata = {
         "text": rendered_text,
-        "segments": segments,
+        "segments": _annotate_segments_from_env(segments),
         "language": "ja",
         "engine": ENGINE_ID,
         "model": config["model_id"],
