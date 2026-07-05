@@ -179,3 +179,24 @@ python3 -m unittest discover -s tests
 - kotoba-whisper v2.2: https://huggingface.co/kotoba-tech/kotoba-whisper-v2.2
 - pyannote speaker diarization: https://huggingface.co/pyannote/speaker-diarization-3.1
 - PyTorch: https://pytorch.org/get-started/locally/
+## Hallucination Snapshot Annotation
+
+`whisper-transcriber` can consume a sidecar hallucination scoring snapshot
+produced by `live-scraping` and write an annotated transcript JSON to an
+explicit output path:
+
+```bash
+python -m kotoba_transcriber.hallucination_snapshot \
+  --transcript input.transcript.json \
+  --snapshot /jobs/live-scraping-jobs/jobs/YYYYMM/<job>/hallucination-scoring-snapshot.json \
+  --output /jobs/live-scraping-jobs/jobs/YYYYMM/<job>/input.annotated.json
+```
+
+The input transcript is read-only. Canonical transcript files are never rewritten
+by this first gate. Each segment in the output receives a `hallucination` object
+with score, bucket, reasons, evidence families, `summary_omit_candidate`,
+snapshot id, and match quality. Unmatched segments are explicitly marked as
+`keep`.
+
+This annotation is for shadow / summary-input-only use. It does not run ASR,
+delete source text, mutate media files, or modify transcript metadata in place.
