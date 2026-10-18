@@ -26,6 +26,11 @@ DEFAULT_MODEL_PYANNOTE = "pyannote/speaker-diarization-3.1"
 DEFAULT_MODEL_DIARIZERS = "diarizers-community/speaker-segmentation-fine-tuned-callhome-jpn"
 DEFAULT_MERGE_GAP_S = 0.75
 
+
+class KotobaPreprocessProtocolError(RuntimeError):
+    """Raised when Kotoba preprocess cannot provide a usable chunk stream."""
+
+
 _logger: Optional[logging.Logger] = None
 _logger_lock = Lock()
 _pipeline_lock = Lock()
@@ -400,6 +405,7 @@ def _get_or_create_pipeline(**overrides: Any):
         )
         _PIPELINE = _create_pipeline(config)
         _patch_pipeline_forward(_PIPELINE)
+        _patch_pipeline_preprocess(_PIPELINE)
         _patch_pipeline_postprocess(_PIPELINE)
         _PIPELINE_SIGNATURE = signature
         return _PIPELINE
@@ -514,6 +520,80 @@ def _patch_pipeline_forward(pipe: Any) -> Any:
 
     pipe._forward = MethodType(metadata_forward, pipe)
     pipe._codex_metadata_forward = True
+    return pipe
+
+
+def _patch_pipeline_preprocess(pipe: Any) -> Any:
+    """Normalize only KotobaWhisperPipeline's terminal marker after exhaustion."""
+    pipeline_type = type(pipe)
+    pipeline_module = getattr(pipeline_type, "__module__", "")
+    if (
+        pipeline_type.__name__ != "KotobaWhisperPipeline"
+        or not pipeline_module.startswith("transformers_modules.")
+        or not pipeline_module.endswith(".kotoba_whisper")
+    ):
+        return pipe
+    if getattr(pipe, "_codex_terminal_preprocess", False):
+        return pipe
+
+    original_preprocess = getattr(pipe, "preprocess", None)
+    if not callable(original_preprocess):
+        return pipe
+
+    def terminal_preprocess(self: Any, *args: Any, **kwargs: Any):
+        del self
+        preprocess_result = original_preprocess(*args, **kwargs)
+        try:
+            iterator = iter(preprocess_result)
+        except TypeError as exc:
+            raise KotobaPreprocessProtocolError(
+                "Kotoba preprocess did not return an iterable"
+            ) from exc
+
+        try:
+            pending = next(iterator)
+        except StopIteration as exc:
+            raise KotobaPreprocessProtocolError(
+                "Kotoba preprocess emitted no items"
+            ) from exc
+
+        if not isinstance(pending, dict):
+            raise KotobaPreprocessProtocolError(
+                "Kotoba preprocess emitted a non-mapping item"
+            )
+
+        emitted_count = 1
+        while True:
+            if not isinstance(pending, dict):
+                raise KotobaPreprocessProtocolError(
+                    "Kotoba preprocess emitted a non-mapping item"
+                )
+            try:
+                next_item = next(iterator)
+            except StopIteration:
+                if pending.get("is_last") is True:
+                    terminal_item = pending
+                else:
+                    terminal_item = dict(pending)
+                    terminal_item["is_last"] = True
+                    _log(
+                        "Kotoba preprocess protocol normalized: "
+                        f"chunks={emitted_count} terminal_normalized=true",
+                        "info",
+                    )
+                yield terminal_item
+                return
+            except Exception:
+                # The buffered item is not validated as terminal until the
+                # source exhausts normally; never release it on failure.
+                raise
+
+            yield pending
+            emitted_count += 1
+            pending = next_item
+
+    pipe.preprocess = MethodType(terminal_preprocess, pipe)
+    pipe._codex_terminal_preprocess = True
     return pipe
 
 
