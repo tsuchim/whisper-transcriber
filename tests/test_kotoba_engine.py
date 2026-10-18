@@ -9,6 +9,11 @@ from unittest import TestCase
 from unittest.mock import patch
 
 
+def _mark_as_kotoba_pipeline(pipe):
+    type(pipe).__module__ = "transformers_modules.kotoba_test.synthetic.kotoba_whisper"
+    return pipe
+
+
 def _load_engine_module():
     engine_path = Path(__file__).resolve().parent.parent / "kotoba_transcriber" / "engine.py"
     spec = importlib.util.spec_from_file_location("kotoba_engine_test", engine_path)
@@ -175,6 +180,297 @@ class TestKotobaEngine(TestCase):
 
         self.assertIsNone(module._PIPELINE)
         self.assertIsNone(module._PIPELINE_SIGNATURE)
+
+    def test_patch_pipeline_preprocess_normalizes_final_item_after_zero_sample_tail(self) -> None:
+        module = _load_engine_module()
+        sample_rate = 16000
+        audio_array = np.arange(sample_rate, dtype=np.float32)
+        speaker_spans = [(0.0, 1.0), (1.000001, 1.000002)]
+        source_payloads = []
+
+        class KotobaWhisperPipeline:
+            def preprocess(self, audio_input, **kwargs):
+                self.received = (audio_input, kwargs)
+                for span_index, (start, end) in enumerate(speaker_spans):
+                    start_sample = round(start * sample_rate)
+                    end_sample = round(end * sample_rate)
+                    segment = audio_input["array"][start_sample:end_sample]
+                    if segment.size == 0:
+                        continue
+                    source_payloads.append(segment)
+                    # Source marks the last planned span, not the last emitted
+                    # span; a zero-sample final span therefore leaves this false.
+                    yield {
+                        "input_features": segment,
+                        "speaker_span": [start, end],
+                        "is_last": span_index == len(speaker_spans) - 1,
+                    }
+
+        pipe = _mark_as_kotoba_pipeline(KotobaWhisperPipeline())
+        original_input = {"array": audio_array, "sampling_rate": sample_rate}
+        self.assertEqual(round(speaker_spans[-1][0] * sample_rate), round(speaker_spans[-1][1] * sample_rate))
+        with patch.object(module, "_log") as log:
+            module._patch_pipeline_preprocess(pipe)
+            result = list(pipe.preprocess(original_input, chunk_length_s=15))
+
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0]["input_features"], source_payloads[0])
+        self.assertEqual(result[0]["speaker_span"], [0.0, 1.0])
+        self.assertTrue(result[0]["is_last"])
+        self.assertEqual(result[0]["input_features"].size, sample_rate)
+        self.assertIs(pipe.received[0], original_input)
+        self.assertEqual(pipe.received[1], {"chunk_length_s": 15})
+        log.assert_called_once_with(
+            "Kotoba preprocess protocol normalized: chunks=1 terminal_normalized=true",
+            "info",
+        )
+
+    def test_patch_pipeline_preprocess_normalizes_last_item_when_final_label_is_empty(self) -> None:
+        module = _load_engine_module()
+
+        class KotobaWhisperPipeline:
+            def preprocess(self, audio_input):
+                # A previous label has an emitted chunk; the final label's
+                # timeline is empty and contributes no item.
+                yield {"input_features": "earlier-label", "is_last": False}
+
+        pipe = _mark_as_kotoba_pipeline(KotobaWhisperPipeline())
+        module._patch_pipeline_preprocess(pipe)
+        result = list(pipe.preprocess({"array": np.zeros(1), "sampling_rate": 16000}))
+
+        self.assertEqual([item["input_features"] for item in result], ["earlier-label"])
+        self.assertEqual([item["is_last"] for item in result], [True])
+
+    def test_patch_pipeline_preprocess_keeps_partial_batch_and_multispeaker_payloads(self) -> None:
+        module = _load_engine_module()
+        source_items = [
+            {
+                "input_features": np.full((1, 4), index, dtype=np.float32),
+                "speaker_id": "SPEAKER_00" if index % 2 == 0 else "SPEAKER_01",
+                "speaker_span": [float(index), float(index) + 0.5],
+                "is_last": False,
+            }
+            for index in range(9)
+        ]
+
+        class KotobaWhisperPipeline:
+            def preprocess(self, audio_input):
+                self.received_input = audio_input
+                yield from source_items
+
+        pipe = _mark_as_kotoba_pipeline(KotobaWhisperPipeline())
+        audio_input = {"array": np.zeros(16000, dtype=np.float32), "sampling_rate": 16000}
+        module._patch_pipeline_preprocess(pipe)
+        result = list(pipe.preprocess(audio_input))
+        batches = [
+            result[offset : offset + module.DEFAULT_BATCH_SIZE]
+            for offset in range(0, len(result), module.DEFAULT_BATCH_SIZE)
+        ]
+
+        self.assertIs(pipe.received_input, audio_input)
+        self.assertEqual([len(batch) for batch in batches], [8, 1])
+        self.assertEqual(len(result), len(source_items))
+        for index, item in enumerate(result):
+            self.assertIs(item["input_features"], source_items[index]["input_features"])
+            self.assertEqual(item["speaker_id"], source_items[index]["speaker_id"])
+            self.assertEqual(item["speaker_span"], source_items[index]["speaker_span"])
+        self.assertEqual([item["is_last"] for item in result], [False] * 8 + [True])
+
+    def test_patch_pipeline_preprocess_leaves_unrelated_pipeline_unchanged(self) -> None:
+        module = _load_engine_module()
+
+        class KotobaWhisperPipeline:
+            def preprocess(self):
+                yield {"input_features": "payload", "is_last": False}
+
+        pipe = KotobaWhisperPipeline()
+        original_preprocess = pipe.preprocess.__func__
+        module._patch_pipeline_preprocess(pipe)
+
+        self.assertIs(pipe.preprocess.__func__, original_preprocess)
+        self.assertFalse(hasattr(pipe, "_codex_terminal_preprocess"))
+        self.assertEqual(list(pipe.preprocess()), [{"input_features": "payload", "is_last": False}])
+
+    def test_patch_pipeline_preprocess_preserves_normal_and_existing_end_flags(self) -> None:
+        module = _load_engine_module()
+        for flags in ((False, True), (True, True)):
+            with self.subTest(flags=flags):
+                source_items = [
+                    {"input_features": "first", "is_last": flags[0]},
+                    {"input_features": "second", "is_last": flags[1]},
+                ]
+
+                class KotobaWhisperPipeline:
+                    def preprocess(self):
+                        yield from source_items
+
+                pipe = _mark_as_kotoba_pipeline(KotobaWhisperPipeline())
+                module._patch_pipeline_preprocess(pipe)
+                with patch.object(module, "_log") as log:
+                    result = list(pipe.preprocess())
+
+                self.assertEqual(result, source_items)
+                self.assertEqual([item["input_features"] for item in result], ["first", "second"])
+                self.assertEqual([item["is_last"] for item in result], list(flags))
+                log.assert_not_called()
+
+    def test_patch_pipeline_preprocess_rejects_empty_stream(self) -> None:
+        module = _load_engine_module()
+
+        class KotobaWhisperPipeline:
+            def preprocess(self):
+                if False:
+                    yield {}
+
+        pipe = _mark_as_kotoba_pipeline(KotobaWhisperPipeline())
+        module._patch_pipeline_preprocess(pipe)
+
+        with self.assertRaisesRegex(module.KotobaPreprocessProtocolError, "no items"):
+            list(pipe.preprocess())
+
+    def test_patch_pipeline_preprocess_rejects_non_mapping_items(self) -> None:
+        module = _load_engine_module()
+
+        class KotobaWhisperPipeline:
+            def preprocess(self):
+                yield {"input_features": "valid", "is_last": False}
+                yield object()
+
+        pipe = _mark_as_kotoba_pipeline(KotobaWhisperPipeline())
+        module._patch_pipeline_preprocess(pipe)
+        seen = []
+
+        with self.assertRaisesRegex(module.KotobaPreprocessProtocolError, "non-mapping"):
+            for item in pipe.preprocess():
+                seen.append(item)
+
+        self.assertEqual([item["input_features"] for item in seen], ["valid"])
+        self.assertEqual([item["is_last"] for item in seen], [False])
+
+    def test_patch_pipeline_preprocess_propagates_call_error(self) -> None:
+        module = _load_engine_module()
+
+        class KotobaWhisperPipeline:
+            def preprocess(self):
+                raise TypeError("synthetic preprocess call failure")
+
+        pipe = _mark_as_kotoba_pipeline(KotobaWhisperPipeline())
+        module._patch_pipeline_preprocess(pipe)
+
+        with self.assertRaisesRegex(TypeError, "synthetic preprocess call failure"):
+            list(pipe.preprocess())
+
+    def test_patch_pipeline_preprocess_propagates_failure_without_terminal_normalization(self) -> None:
+        module = _load_engine_module()
+        source_items = [
+            {"input_features": "first", "is_last": False},
+            {"input_features": "second", "is_last": False},
+        ]
+        failure = ValueError("synthetic preprocess failure")
+
+        class KotobaWhisperPipeline:
+            def preprocess(self):
+                yield from source_items
+                raise failure
+
+        pipe = _mark_as_kotoba_pipeline(KotobaWhisperPipeline())
+        module._patch_pipeline_preprocess(pipe)
+        seen = []
+        with patch.object(module, "_log") as log:
+            with self.assertRaises(ValueError) as raised:
+                for item in pipe.preprocess():
+                    seen.append(item)
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(seen, [source_items[0]])
+        self.assertFalse(any(item.get("is_last") is True for item in seen))
+        log.assert_not_called()
+
+    def test_patch_pipeline_preprocess_does_not_release_terminal_pending_item_on_failure(self) -> None:
+        module = _load_engine_module()
+        failure = ValueError("failure after terminal-looking item")
+        terminal_item = {"input_features": "unvalidated-tail", "is_last": True}
+
+        class KotobaWhisperPipeline:
+            def preprocess(self):
+                yield terminal_item
+                raise failure
+
+        pipe = _mark_as_kotoba_pipeline(KotobaWhisperPipeline())
+        module._patch_pipeline_preprocess(pipe)
+
+        with self.assertRaises(ValueError) as raised:
+            next(iter(pipe.preprocess()))
+
+        self.assertIs(raised.exception, failure)
+
+    def test_patch_pipeline_preprocess_is_idempotent(self) -> None:
+        module = _load_engine_module()
+        preprocess_calls = []
+        source_items = [{"input_features": "only-item", "is_last": False}]
+
+        class SinglePassItems:
+            def __init__(self):
+                self.iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                if self.iterations > 1:
+                    raise AssertionError("preprocess output was traversed more than once")
+                yield from source_items
+
+        output = SinglePassItems()
+
+        class KotobaWhisperPipeline:
+            def preprocess(self):
+                preprocess_calls.append(None)
+                return output
+
+        pipe = _mark_as_kotoba_pipeline(KotobaWhisperPipeline())
+        module._patch_pipeline_preprocess(pipe)
+        first_wrapper = pipe.preprocess.__func__
+        module._patch_pipeline_preprocess(pipe)
+
+        self.assertIs(pipe.preprocess.__func__, first_wrapper)
+        result = list(pipe.preprocess())
+
+        self.assertEqual(preprocess_calls, [None])
+        self.assertEqual(output.iterations, 1)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["input_features"], "only-item")
+        self.assertTrue(result[0]["is_last"])
+
+    def test_get_or_create_pipeline_installs_preprocess_protocol_patch(self) -> None:
+        module = _load_engine_module()
+
+        class KotobaWhisperPipeline:
+            def preprocess(self, audio_input, **kwargs):
+                self.received = (audio_input, kwargs)
+                yield {"input_features": "only-item", "is_last": False}
+
+        pipe = _mark_as_kotoba_pipeline(KotobaWhisperPipeline())
+        module._PIPELINE = None
+        module._PIPELINE_SIGNATURE = None
+
+        with patch.object(
+            module,
+            "_resolve_pipeline_config",
+            return_value={
+                "model_id": module.MODEL_ID,
+                "device": "cpu",
+                "device_pyannote": "cpu",
+                "model_pyannote": module.DEFAULT_MODEL_PYANNOTE,
+            },
+        ), patch.object(
+            module, "_pipeline_signature", return_value=("candidate",)
+        ), patch.object(module, "_create_pipeline", return_value=pipe), patch.object(
+            module, "_patch_pipeline_forward", side_effect=lambda value: value
+        ):
+            result = module._get_or_create_pipeline()
+
+        self.assertIs(result, pipe)
+        self.assertTrue(list(pipe.preprocess({"array": "payload"}))[0]["is_last"])
+        self.assertEqual(pipe.received, ({"array": "payload"}, {}))
 
     def test_patch_pipeline_postprocess_handles_missing_end_timestamp(self) -> None:
         module = _load_engine_module()

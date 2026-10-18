@@ -19,6 +19,10 @@
 
 つまり、`AutoModelForSpeechSeq2Seq + generate()` を直接回す構成ではありません。
 
+### Kotoba preprocess の終端マーカー互換性
+
+エンジンは `KotobaWhisperPipeline` の `preprocess` が出力し終えたことを確認してから、最後に実際に出力されたチャンクへ `is_last=True` を設定します。チャンクの入力データは保持します。空の出力や途中の例外はエラーとして扱い、音声や文字起こし結果を補いません。終端マーカーを補正した場合は、チャンク数と補正有無だけをログに記録します。
+
 ## 出力
 
 単一入力 `sample.wav` に対して、以下を生成します。
